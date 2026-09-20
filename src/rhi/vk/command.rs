@@ -3,14 +3,16 @@
 use super::{
     descriptor::VkDescriptorSet,
     pipeline::VkPipeline,
+    queue::VkQueueRegistry,
     resource::{VkBuffer, VkImage, VkImageView},
 };
 use crate::rhi::{
     command::{
-        BufferImageCopy, ClearValue, Command, ImageAspect, ImageCopyRegion, ImageSubresourceLayers,
+        BufferImageCopy, ClearValue, ImageAspect, ImageCopyRegion, ImageSubresourceLayers,
         IndexType, LoadOp, Rect, RenderingDesc, RhiCommandBuffer, StoreOp, Viewport,
     },
     descriptor::RhiDescriptorSet,
+    error::RhiResult,
     pipeline::RhiPipeline,
     resource::{
         Access, ResourceRange, ResourceRef, ResourceState, RhiBuffer, RhiImage, RhiImageView,
@@ -19,7 +21,10 @@ use crate::rhi::{
     shader::ShaderStageFlags,
 };
 use ash::vk;
-use std::fmt::{Debug, Formatter};
+use std::{
+    fmt::{Debug, Formatter},
+    sync::Arc,
+};
 
 /// A non-owning Vulkan command-buffer recorder.
 ///
@@ -28,11 +33,20 @@ use std::fmt::{Debug, Formatter};
 pub(crate) struct VkCommandBuffer {
     handle: vk::CommandBuffer,
     device: ash::Device,
+    queues: Arc<VkQueueRegistry>,
 }
 
 impl VkCommandBuffer {
-    pub(crate) fn new(device: ash::Device, handle: vk::CommandBuffer) -> Self {
-        Self { handle, device }
+    pub(crate) fn new(
+        device: ash::Device,
+        handle: vk::CommandBuffer,
+        queues: Arc<VkQueueRegistry>,
+    ) -> Self {
+        Self {
+            handle,
+            device,
+            queues,
+        }
     }
 
     pub(crate) fn handle(&self) -> vk::CommandBuffer {
@@ -49,15 +63,23 @@ impl Debug for VkCommandBuffer {
 }
 
 impl RhiCommandBuffer for VkCommandBuffer {
-    fn begin(&mut self) {
-        let info = vk::CommandBufferBeginInfo::default();
-        unsafe { self.device.begin_command_buffer(self.handle, &info) }
-            .expect("failed to begin Vulkan command buffer");
+    fn reset(&mut self) -> RhiResult<()> {
+        unsafe {
+            self.device
+                .reset_command_buffer(self.handle, vk::CommandBufferResetFlags::empty())
+        }?;
+        Ok(())
     }
 
-    fn finish(&mut self) {
-        unsafe { self.device.end_command_buffer(self.handle) }
-            .expect("failed to finish Vulkan command buffer");
+    fn begin(&mut self) -> RhiResult<()> {
+        let info = vk::CommandBufferBeginInfo::default();
+        unsafe { self.device.begin_command_buffer(self.handle, &info) }?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> RhiResult<()> {
+        unsafe { self.device.end_command_buffer(self.handle) }?;
+        Ok(())
     }
 
     fn barrier(&mut self, descs: &[Transition<'_>]) {
@@ -80,8 +102,21 @@ impl RhiCommandBuffer for VkCommandBuffer {
                     src_access = vk::AccessFlags2::NONE;
                 }
             }
-            let src_queue_family_index = vk::QUEUE_FAMILY_IGNORED;
-            let dst_queue_family_index = vk::QUEUE_FAMILY_IGNORED;
+            let (src_queue_family_index, dst_queue_family_index) = match transition.kind {
+                TransitionKind::Memory => (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
+                TransitionKind::Release | TransitionKind::Acquire => {
+                    let source = transition
+                        .before
+                        .map(|state| self.queues.family(state.queue))
+                        .unwrap_or(vk::QUEUE_FAMILY_IGNORED);
+                    let target = self.queues.family(transition.after.queue);
+                    if source == target {
+                        (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+                    } else {
+                        (source, target)
+                    }
+                }
+            };
             match (transition.resource, transition.range) {
                 (ResourceRef::Buffer(buffer), ResourceRange::Buffer { offset, size }) => buffers
                     .push(
@@ -472,97 +507,6 @@ impl RhiCommandBuffer for VkCommandBuffer {
     fn begin_debug_label(&mut self, _name: &str) {}
     fn end_debug_label(&mut self) {}
     fn insert_debug_label(&mut self, _name: &str) {}
-}
-
-fn record_command(buffer: &mut dyn RhiCommandBuffer, command: Command<'_>) {
-    match command {
-        Command::BeginRendering(desc) => buffer.begin_rendering(&desc),
-        Command::EndRendering => buffer.end_rendering(),
-        Command::Draw {
-            vertex_count,
-            instance_count,
-            first_vertex,
-            first_instance,
-        } => buffer.draw(vertex_count, instance_count, first_vertex, first_instance),
-        Command::DrawIndexed {
-            index_count,
-            instance_count,
-            first_index,
-            vertex_offset,
-            first_instance,
-        } => buffer.draw_indexed(
-            index_count,
-            instance_count,
-            first_index,
-            vertex_offset,
-            first_instance,
-        ),
-        Command::DrawIndirect {
-            buffer: resource,
-            offset,
-            draw_count,
-            stride,
-        } => buffer.draw_indirect(resource, offset, draw_count, stride),
-        Command::DrawIndexedIndirect {
-            buffer: resource,
-            offset,
-            draw_count,
-            stride,
-        } => buffer.draw_indexed_indirect(resource, offset, draw_count, stride),
-        Command::Dispatch(count) => buffer.dispatch(count),
-        Command::DispatchIndirect {
-            buffer: resource,
-            offset,
-        } => buffer.dispatch_indirect(resource, offset),
-        Command::CopyBuffer {
-            src,
-            src_offset,
-            dst,
-            dst_offset,
-            size,
-        } => buffer.copy_buffer(src, src_offset, dst, dst_offset, size),
-        Command::CopyBufferToImage { src, dst, region } => {
-            buffer.copy_buffer_to_image(src, dst, &region)
-        }
-        Command::CopyImageToBuffer { src, dst, region } => {
-            buffer.copy_image_to_buffer(src, dst, &region)
-        }
-        Command::CopyImage {
-            src,
-            src_region,
-            dst,
-            dst_region,
-            extent,
-        } => buffer.copy_image(src, &src_region, dst, &dst_region, extent),
-        Command::ReleaseBuffers { .. } | Command::ReleaseImages { .. } => {
-            unreachable!("release commands are consumed by the resource planner")
-        }
-        Command::BindPipeline(pipeline) => buffer.bind_pipeline(pipeline),
-        Command::BindVertexBuffers { first, buffers } => buffer.bind_vertex_buffers(first, buffers),
-        Command::BindIndexBuffer {
-            buffer: resource,
-            offset,
-            index_type,
-        } => buffer.bind_index_buffer(resource, offset, index_type),
-        Command::BindDescriptorSets {
-            pipeline,
-            first_set,
-            sets,
-        } => buffer.bind_descriptor_sets(pipeline, first_set, sets),
-        Command::PushConstants {
-            pipeline,
-            stages,
-            offset,
-            data,
-        } => buffer.push_constants(pipeline, stages, offset, data),
-        Command::SetViewport(viewport) => buffer.set_viewport(&viewport),
-        Command::SetScissor(scissor) => buffer.set_scissor(&scissor),
-        Command::SetBlendConstants(constants) => buffer.set_blend_constants(constants),
-        Command::SetStencilReference(reference) => buffer.set_stencil_reference(reference),
-        Command::BeginDebugLabel(name) => buffer.begin_debug_label(name),
-        Command::EndDebugLabel => buffer.end_debug_label(),
-        Command::InsertDebugLabel(name) => buffer.insert_debug_label(name),
-    }
 }
 
 fn buffer_handle(buffer: &dyn RhiBuffer) -> vk::Buffer {

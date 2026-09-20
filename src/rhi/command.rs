@@ -2,8 +2,10 @@
 
 use crate::rhi::{
     descriptor::RhiDescriptorSet,
+    error::RhiResult,
     pipeline::RhiPipeline,
-    resource::{QueueKind, RhiBuffer, RhiImage, RhiImageView, Transition},
+    queue::QueueKind,
+    resource::{PlannedOp, RhiBuffer, RhiImage, RhiImageView, Transition},
     shader::ShaderStageFlags,
     types::RhiType,
 };
@@ -212,11 +214,14 @@ pub enum Command<'a> {
 
 /// Backend implementation of a command buffer.
 pub(crate) trait RhiCommandBuffer: RhiType {
+    /// Prepare a completed or never-submitted command buffer for recording.
+    fn reset(&mut self) -> RhiResult<()>;
+
     /// Begin recording.
-    fn begin(&mut self);
+    fn begin(&mut self) -> RhiResult<()>;
 
     /// Finish recording; the sealed buffer goes to the submit path.
-    fn finish(&mut self);
+    fn finish(&mut self) -> RhiResult<()>;
 
     /// Record one native barrier from tracker-derived descs.
     /// Crate-internal contract: only the recorder calls this, with the
@@ -348,4 +353,109 @@ pub(crate) trait RhiCommandBuffer: RhiType {
 
     /// Insert a single debug label.
     fn insert_debug_label(&mut self, name: &str);
+}
+
+pub(crate) fn record_planned(
+    buffer: &mut dyn RhiCommandBuffer,
+    stream: &[PlannedOp<'_>],
+) -> RhiResult<()> {
+    buffer.begin()?;
+    for operation in stream {
+        match operation {
+            PlannedOp::Barriers(transitions) => buffer.barrier(transitions),
+            PlannedOp::Command(command) => record_command(buffer, *command),
+        }
+    }
+    buffer.finish()
+}
+
+fn record_command(buffer: &mut dyn RhiCommandBuffer, command: Command<'_>) {
+    match command {
+        Command::BeginRendering(desc) => buffer.begin_rendering(&desc),
+        Command::EndRendering => buffer.end_rendering(),
+        Command::Draw {
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+        } => buffer.draw(vertex_count, instance_count, first_vertex, first_instance),
+        Command::DrawIndexed {
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+        } => buffer.draw_indexed(
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+        ),
+        Command::DrawIndirect {
+            buffer: source,
+            offset,
+            draw_count,
+            stride,
+        } => buffer.draw_indirect(source, offset, draw_count, stride),
+        Command::DrawIndexedIndirect {
+            buffer: source,
+            offset,
+            draw_count,
+            stride,
+        } => buffer.draw_indexed_indirect(source, offset, draw_count, stride),
+        Command::Dispatch(count) => buffer.dispatch(count),
+        Command::DispatchIndirect {
+            buffer: source,
+            offset,
+        } => buffer.dispatch_indirect(source, offset),
+        Command::CopyBuffer {
+            src,
+            src_offset,
+            dst,
+            dst_offset,
+            size,
+        } => buffer.copy_buffer(src, src_offset, dst, dst_offset, size),
+        Command::CopyBufferToImage { src, dst, region } => {
+            buffer.copy_buffer_to_image(src, dst, &region)
+        }
+        Command::CopyImageToBuffer { src, dst, region } => {
+            buffer.copy_image_to_buffer(src, dst, &region)
+        }
+        Command::CopyImage {
+            src,
+            src_region,
+            dst,
+            dst_region,
+            extent,
+        } => buffer.copy_image(src, &src_region, dst, &dst_region, extent),
+        Command::ReleaseBuffers { .. } | Command::ReleaseImages { .. } => {
+            unreachable!("release commands are consumed by the resource planner")
+        }
+        Command::BindPipeline(pipeline) => buffer.bind_pipeline(pipeline),
+        Command::BindVertexBuffers { first, buffers } => buffer.bind_vertex_buffers(first, buffers),
+        Command::BindIndexBuffer {
+            buffer: source,
+            offset,
+            index_type,
+        } => buffer.bind_index_buffer(source, offset, index_type),
+        Command::BindDescriptorSets {
+            pipeline,
+            first_set,
+            sets,
+        } => buffer.bind_descriptor_sets(pipeline, first_set, sets),
+        Command::PushConstants {
+            pipeline,
+            stages,
+            offset,
+            data,
+        } => buffer.push_constants(pipeline, stages, offset, data),
+        Command::SetViewport(viewport) => buffer.set_viewport(&viewport),
+        Command::SetScissor(scissor) => buffer.set_scissor(&scissor),
+        Command::SetBlendConstants(constants) => buffer.set_blend_constants(constants),
+        Command::SetStencilReference(reference) => buffer.set_stencil_reference(reference),
+        Command::BeginDebugLabel(name) => buffer.begin_debug_label(name),
+        Command::EndDebugLabel => buffer.end_debug_label(),
+        Command::InsertDebugLabel(name) => buffer.insert_debug_label(name),
+    }
 }

@@ -3,6 +3,7 @@
 use crate::rhi::{
     command::{Command, ImageSubresourceLayers},
     error::{RhiError, RhiResult},
+    queue::{QueueId, QueueKind},
     sync::SyncPoint,
     types::RhiType,
 };
@@ -17,23 +18,6 @@ use std::{
 /// Stable identity used by command planning and deferred destruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ResourceId(u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum QueueKind {
-    Graphics,
-    Transfer,
-}
-
-/// Temporary logical queue identity used only by resource-state planning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct QueueId(u64);
-
-impl QueueId {
-    pub(crate) fn allocate() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-}
 
 impl ResourceId {
     pub(crate) fn allocate() -> Self {
@@ -380,10 +364,12 @@ impl ResourceTracker {
                     access: usage.access,
                     queue,
                 };
-                for current in states
+                let overlapping: Vec<_> = states
                     .iter()
                     .filter(|state| overlaps(state.range, usage.range))
-                {
+                    .copied()
+                    .collect();
+                for current in overlapping {
                     if let Some(target) = current.released_to {
                         if target != queue {
                             return Err(RhiError::ResourceState(format!(
@@ -398,11 +384,16 @@ impl ResourceTracker {
                         };
                         transitions.push(Transition {
                             resource: usage.resource,
-                            range: intersection(current.range, usage.range),
+                            // Vulkan requires acquire to exactly match the
+                            // range of its paired release. Acquiring any part
+                            // of this state therefore acquires the whole
+                            // released state before applying the narrower use.
+                            range: current.range,
                             before: Some(before),
                             after: acquired_state,
                             kind: TransitionKind::Acquire,
                         });
+                        replace_state(states, current.range, acquired_state);
                         did_acquire = true;
                         if needs_transition(Some(acquired_state), after, usage.resource.is_image())
                         {
@@ -929,6 +920,7 @@ fn replace_state(states: &mut Vec<RangeState>, range: ResourceRange, state: Reso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rhi::command::ImageCopyRegion;
     use std::sync::OnceLock;
 
     #[derive(Debug)]
@@ -957,6 +949,25 @@ mod tests {
 
         fn size(&self) -> u64 {
             self.size
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestImage {
+        id: ResourceId,
+    }
+
+    impl TestImage {
+        fn new() -> Self {
+            Self {
+                id: ResourceId::allocate(),
+            }
+        }
+    }
+
+    impl RhiImage for TestImage {
+        fn id(&self) -> ResourceId {
+            self.id
         }
     }
 
@@ -1162,6 +1173,171 @@ mod tests {
         assert!(transitions
             .iter()
             .any(|transition| transition.kind == TransitionKind::Memory));
+    }
+
+    #[test]
+    fn partial_use_acquires_the_complete_released_buffer_range() {
+        let tracker = Arc::new(ResourceTracker::new());
+        let staging = TestBuffer::new(64);
+        let uploaded = TestBuffer::new(64);
+        let output = TestBuffer::new(16);
+        let released: [&dyn RhiBuffer; 1] = [&uploaded];
+        let transfer_commands = [
+            Command::CopyBuffer {
+                src: &staging,
+                src_offset: 0,
+                dst: &uploaded,
+                dst_offset: 0,
+                size: 64,
+            },
+            Command::ReleaseBuffers {
+                buffers: &released,
+                target: QueueKind::Graphics,
+            },
+        ];
+        let (transfer_plan, transfer_transaction) = tracker
+            .plan(transfer_queue(), &transfer_commands, resolve_queue)
+            .unwrap();
+        let release = transfer_plan
+            .iter()
+            .filter_map(|operation| match operation {
+                PlannedOp::Barriers(transitions) => transitions
+                    .iter()
+                    .find(|transition| {
+                        transition.kind == TransitionKind::Release
+                            && transition.resource.id() == uploaded.id()
+                    })
+                    .copied(),
+                PlannedOp::Command(_) => None,
+            })
+            .next()
+            .expect("transfer plan must release the uploaded buffer");
+        assert_eq!(
+            release.range,
+            ResourceRange::Buffer {
+                offset: 0,
+                size: 64
+            }
+        );
+        transfer_transaction.commit(SyncPoint::new(17, 3));
+
+        let graphics_commands = [Command::CopyBuffer {
+            src: &uploaded,
+            src_offset: 16,
+            dst: &output,
+            dst_offset: 0,
+            size: 16,
+        }];
+        let (graphics_plan, _graphics_transaction) = tracker
+            .plan(graphics_queue(), &graphics_commands, resolve_queue)
+            .unwrap();
+        let transitions: Vec<_> = graphics_plan
+            .iter()
+            .filter_map(|operation| match operation {
+                PlannedOp::Barriers(transitions) => Some(transitions.as_slice()),
+                PlannedOp::Command(_) => None,
+            })
+            .flatten()
+            .filter(|transition| transition.resource.id() == uploaded.id())
+            .collect();
+        let acquire = transitions
+            .iter()
+            .find(|transition| transition.kind == TransitionKind::Acquire)
+            .expect("partial use must acquire ownership");
+        assert_eq!(acquire.range, release.range);
+        let memory = transitions
+            .iter()
+            .find(|transition| transition.kind == TransitionKind::Memory)
+            .expect("transfer write to transfer read needs a memory transition");
+        assert_eq!(
+            memory.range,
+            ResourceRange::Buffer {
+                offset: 16,
+                size: 16
+            }
+        );
+    }
+
+    #[test]
+    fn image_acquire_matches_its_released_subresource_state() {
+        let tracker = Arc::new(ResourceTracker::new());
+        let source = TestImage::new();
+        let uploaded = TestImage::new();
+        let output = TestImage::new();
+        let released: [&dyn RhiImage; 1] = [&uploaded];
+        let two_layers = ImageSubresourceLayers {
+            aspect: ImageAspect::Color,
+            mip: 0,
+            base_layer: 0,
+            layer_count: 2,
+        };
+        let transfer_commands = [
+            Command::CopyImage {
+                src: &source,
+                src_region: ImageCopyRegion {
+                    subresource: two_layers,
+                    offset: [0; 3],
+                },
+                dst: &uploaded,
+                dst_region: ImageCopyRegion {
+                    subresource: two_layers,
+                    offset: [0; 3],
+                },
+                extent: [1; 3],
+            },
+            Command::ReleaseImages {
+                images: &released,
+                target: QueueKind::Graphics,
+            },
+        ];
+        let (transfer_plan, transfer_transaction) = tracker
+            .plan(transfer_queue(), &transfer_commands, resolve_queue)
+            .unwrap();
+        transfer_transaction.commit(SyncPoint::new(19, 2));
+
+        let one_layer = ImageSubresourceLayers {
+            layer_count: 1,
+            ..two_layers
+        };
+        let graphics_commands = [Command::CopyImage {
+            src: &uploaded,
+            src_region: ImageCopyRegion {
+                subresource: one_layer,
+                offset: [0; 3],
+            },
+            dst: &output,
+            dst_region: ImageCopyRegion {
+                subresource: one_layer,
+                offset: [0; 3],
+            },
+            extent: [1; 3],
+        }];
+        let (graphics_plan, _graphics_transaction) = tracker
+            .plan(graphics_queue(), &graphics_commands, resolve_queue)
+            .unwrap();
+        let acquire = graphics_plan
+            .iter()
+            .filter_map(|operation| match operation {
+                PlannedOp::Barriers(transitions) => transitions.iter().find(|transition| {
+                    transition.kind == TransitionKind::Acquire
+                        && transition.resource.id() == uploaded.id()
+                }),
+                PlannedOp::Command(_) => None,
+            })
+            .next()
+            .expect("partial image use must acquire its released state");
+        let matching_release = transfer_plan.iter().any(|operation| match operation {
+            PlannedOp::Barriers(transitions) => transitions.iter().any(|transition| {
+                transition.kind == TransitionKind::Release
+                    && transition.resource.id() == uploaded.id()
+                    && transition.range == acquire.range
+            }),
+            PlannedOp::Command(_) => false,
+        });
+        assert!(
+            matching_release,
+            "acquire must exactly match a release range"
+        );
     }
 
     #[test]

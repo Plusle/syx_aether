@@ -3,11 +3,13 @@
 use super::{
     allocator::Allocator,
     instance::Instance,
+    queue::{VkCommandQueue, VkQueueInfo, VkQueueRegistry},
     resource::{VkBuffer, VkImage, VkImageView, VkSampler},
 };
 use crate::rhi::{
     backend::RhiBackend,
     error::{RhiError, RhiResult},
+    queue::{QueueId, QueueKind, RhiQueue},
     resource::{ResourceTracker, RhiBuffer, RhiImage, RhiImageView, RhiSampler},
     sync::SyncPoint,
     types::{BufferDesc, ImageDesc, ImageViewDesc, SamplerDesc},
@@ -60,13 +62,14 @@ impl Device {
 
             let queue_families =
                 unsafe { inst.get_physical_device_queue_family_properties(physical_device) };
-            let graphics_family = match queue_families
-                .iter()
-                .position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            {
+            let graphics_family = match queue_families.iter().position(|family| {
+                family
+                    .queue_flags
+                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            }) {
                 Some(index) => index as u32,
                 None => {
-                    warn!("Skipping {}: no graphics queue family", device_name);
+                    warn!("Skipping {}: no graphics+compute queue family", device_name);
                     continue;
                 }
             };
@@ -256,15 +259,62 @@ impl Drop for Device {
 }
 
 pub struct VulkanDevice {
+    graphics_queue: VkCommandQueue,
+    transfer_queue: VkCommandQueue,
     ctx: Arc<Device>,
     timelines: HashSet<vk::Semaphore>,
 }
 
 impl VulkanDevice {
     pub fn new(ctx: Device) -> RhiResult<Self> {
+        let ctx = Arc::new(ctx);
+        let graphics_info = VkQueueInfo {
+            id: QueueId::allocate(),
+            kind: QueueKind::Graphics,
+            family: ctx.graphics_queue_family,
+            index: 0,
+        };
+        let transfer_info = VkQueueInfo {
+            id: QueueId::allocate(),
+            kind: QueueKind::Transfer,
+            family: ctx.transfer_queue_family,
+            index: ctx.transfer_queue_index,
+        };
+        let registry = Arc::new(VkQueueRegistry::new([graphics_info, transfer_info]));
+        let graphics_handle = unsafe {
+            ctx.device
+                .get_device_queue(graphics_info.family, graphics_info.index)
+        };
+        let transfer_handle = unsafe {
+            ctx.device
+                .get_device_queue(transfer_info.family, transfer_info.index)
+        };
+        let graphics_submit_gate = Arc::new(Mutex::new(()));
+        let transfer_submit_gate = if graphics_handle == transfer_handle {
+            Arc::clone(&graphics_submit_gate)
+        } else {
+            Arc::new(Mutex::new(()))
+        };
+        let graphics_queue = VkCommandQueue::new(
+            Arc::clone(&ctx),
+            graphics_info,
+            Arc::clone(&ctx.tracker),
+            Arc::clone(&registry),
+            graphics_submit_gate,
+        )?;
+        let transfer_queue = VkCommandQueue::new(
+            Arc::clone(&ctx),
+            transfer_info,
+            Arc::clone(&ctx.tracker),
+            registry,
+            transfer_submit_gate,
+        )?;
+        let timelines = HashSet::from([graphics_queue.timeline(), transfer_queue.timeline()]);
         Ok(Self {
-            ctx: Arc::new(ctx),
-            timelines: HashSet::new(),
+            graphics_queue,
+            transfer_queue,
+            ctx,
+            timelines,
         })
     }
 
@@ -279,7 +329,25 @@ impl Debug for VulkanDevice {
     }
 }
 
+impl Drop for VulkanDevice {
+    fn drop(&mut self) {
+        // Queue timelines can be referenced by waits submitted to another
+        // queue. Make every such operation complete before individual queue
+        // fields destroy their timeline semaphores.
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+    }
+}
+
 impl RhiBackend for VulkanDevice {
+    fn queue(&self, kind: QueueKind) -> RhiResult<&dyn RhiQueue> {
+        Ok(match kind {
+            QueueKind::Graphics => &self.graphics_queue,
+            QueueKind::Transfer => &self.transfer_queue,
+        })
+    }
+
     fn create_buffer(&self, desc: BufferDesc) -> RhiResult<Arc<dyn RhiBuffer>> {
         Ok(Arc::new(VkBuffer::new(Arc::clone(&self.ctx), desc)?))
     }

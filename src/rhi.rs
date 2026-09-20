@@ -3,6 +3,7 @@ pub mod command;
 pub mod descriptor;
 pub mod error;
 pub mod pipeline;
+pub mod queue;
 pub mod resource;
 pub mod shader;
 pub mod sync;

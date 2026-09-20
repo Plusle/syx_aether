@@ -2,6 +2,7 @@
 
 use crate::rhi::{
     error::{RhiError, RhiResult},
+    queue::{QueueKind, RhiQueue},
     resource::{RhiBuffer, RhiImage, RhiImageView, RhiSampler},
     sync::SyncPoint,
     types::{BufferDesc, ImageDesc, ImageViewDesc, RhiType, SamplerDesc},
@@ -24,6 +25,8 @@ pub fn bootstrap(t: BackendType) -> Result<(), RhiError> {
 pub fn terminate() {}
 
 pub(crate) trait RhiBackend: RhiType {
+    fn queue(&self, kind: QueueKind) -> RhiResult<&dyn RhiQueue>;
+
     fn create_buffer(&self, desc: BufferDesc) -> RhiResult<Arc<dyn RhiBuffer>>;
     fn create_image(&self, desc: ImageDesc) -> RhiResult<Arc<dyn RhiImage>>;
     fn create_sampler(&self, desc: SamplerDesc) -> RhiResult<Arc<dyn RhiSampler>>;

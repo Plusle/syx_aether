@@ -9,7 +9,7 @@
 - queue 是 backend-neutral trait；具体后端 queue 拥有自己的 timeline、command pool、空闲 command buffer 和待完成 command buffer。
 - recorder 在创建时取得并独占一个 `Arc<dyn RhiCommandBuffer>`。
 - recorder 按输入顺序保存 `Command<'a>`，在 `build()` 时通过全局 tracker 自动插入 barrier，并录制到后端 command buffer。
-- queue 通过 `queue.submit(recorder)` 提交已经 build 成功的 recorder；提交成功后，command buffer 进入该 queue 的 pending 列表。
+- `Recorder::build(self)` 成功后产生 `BuiltRecorder`；queue 通过 `queue.submit(built_recorder)` 提交，成功后 command buffer 进入该 queue 的 pending 列表。
 - queue 定期读取自己的 timeline，把已经完成的 pending command buffer 移回 unused 列表。
 - command buffer 回收不经过全局 discard manager。
 - discard manager 仍是独立的设备级全局管理器，仅负责 GPU 资源的延迟销毁，并使用 mutex 保护。
@@ -68,14 +68,17 @@ recorder 由指定 queue 创建，并拥有：
 Recorder<'queue, 'command>
 ├── originating queue exclusive lease
 ├── command_buffer: Arc<dyn RhiCommandBuffer>
-├── commands: Vec<Command<'command>>
-├── tracker transaction（build 成功后存在）
-└── state: recording | built
+└── commands: Vec<Command<'command>>
+
+BuiltRecorder<'queue>
+├── originating queue exclusive lease
+├── command_buffer: Arc<dyn RhiCommandBuffer>
+└── tracker transaction
 ```
 
 recorder 不拥有 tracker，也不拥有 timeline。
 
-一个 recorder 只能提交回创建它的 queue，不能跨 queue 提交。
+`Recorder` 只能录制和 build，不能提交；只有 `BuiltRecorder` 能提交。built recorder 只能提交回创建它的 queue，不能跨 queue 提交。
 
 ## 3. RHI command buffer
 
@@ -135,9 +138,9 @@ timeline 由 queue 自己拥有。一次成功提交：
 以下接口表示语义，不固定为最终 trait 签名：
 
 ```text
-make_recorder() -> Result<Recorder>
+make_recorder() -> Result<Recorder<'queue, 'command>>
 allocate() -> Result<Arc<dyn RhiCommandBuffer>>
-submit(built_recorder) -> Result<SyncPoint>
+submit(BuiltRecorder<'queue>) -> Result<SyncPoint>
 force_flush() -> Result<()>
 ```
 
@@ -168,13 +171,13 @@ queue 提交时必须尝试一次非阻塞 flush：
 
 ### 5.3 `submit()`
 
-`submit()` 只接受：
+`submit()` 的类型签名只接受 `BuiltRecorder`。运行时仍校验它由当前 queue 创建且尚未提交。
 
 - 由当前 queue 创建；
-- `build()` 已成功；
+- 已由 `build()` 成功产生；
 - 尚未提交；
 
-的 recorder。
+的 built recorder。
 
 建议顺序：
 
@@ -190,7 +193,7 @@ queue 提交时必须尝试一次非阻塞 flush：
 
 - native submit 失败时，tracker transaction 必须 rollback。
 - command buffer 没有进入 GPU pending 状态，应回到 unused；下次取用时由后端 reset/reinitialize。
-- 调用者得到错误，不能再次提交同一个 recorder。
+- 调用者得到错误；built recorder 已被消费，不能再次提交。
 
 ### 5.4 `force_flush()`
 
@@ -211,7 +214,7 @@ queue drop 前必须执行等价的等待，然后才能销毁 timeline、comman
 
 `queue.make_recorder()`：
 
-1. 取得本 queue 的独占 lease；该 lease 持续到 recorder 被 submit 或 drop。
+1. 取得本 queue 的独占 lease；build 成功时 lease 转移给 built recorder，并持续到 submit 或 drop。
 2. 调用本 queue 的 `allocate()`。
 3. 创建 recorder，并把 `Arc<dyn RhiCommandBuffer>` 所有权移入 recorder。
 4. 初始化空的 command vector。
@@ -223,12 +226,25 @@ queue drop 前必须执行等价的等待，然后才能销毁 timeline、comman
 
 ### 6.2 添加命令
 
-recorder 按调用顺序保存 `Command<'command>`：
+recorder 按调用顺序保存 `Command<'command>`。动态生成命令可使用：
 
 ```text
 push(command)
 extend(commands)
 ```
+
+也可以使用消费 `self`、返回 `Self` 的 typed fluent 方法链。每个 `Command` variant 都有对应方法，例如：
+
+```text
+queue.recorder()?
+    .begin_debug_label("upload")
+    .copy_buffer(src, 0, dst, 0, size)
+    .release_buffers(buffers, QueueKind::Graphics)
+    .end_debug_label()
+    .build()?
+```
+
+fluent API 只描述 RHI 命令，不公开 native command-buffer 的 begin/finish。
 
 manual release 是命令流中的命令，并保留精确位置，例如：
 
@@ -240,15 +256,15 @@ copy C -> D
 
 release 不能被移动到 command stream 末尾。
 
-### 6.3 `build() -> Result<()>`
+### 6.3 `build(self) -> Result<BuiltRecorder<'queue>>`
 
-`build()` 消费当前 command vector 的语义，但 recorder 本身、独占 lease 和 command buffer 仍然存在。成功后 recorder 进入 built 状态。
+`build()` 消费 `Recorder<'queue, 'command>`。成功后返回不再携带 `'command` 生命周期的 `BuiltRecorder<'queue>`，因此命令参数借用只需持续到 build 完成；queue lease、command buffer 和 tracker transaction 被转移到 built recorder。
 
 build 流程：
 
-1. 验证 command stream 的结构，例如 rendering scope 和 debug label 配对。
-2. 请求全局 `ResourceTracker` 分析资源读写、范围和 queue ownership。
-3. tracker 创建暂定 transaction，预留涉及的资源。
+1. 后端验证对象归属和 queue capability，不允许 foreign backend 对象或 queue 不支持的命令进入 native recording。
+2. 验证 command stream 的结构，例如 rendering scope 和 debug label 配对。
+3. 请求全局 `ResourceTracker` 分析资源读写、范围和 queue ownership，并创建暂定 transaction。
 4. tracker 按原始命令顺序生成 planned stream：
    - 自动 memory barrier；
    - 自动 acquire barrier；
@@ -259,24 +275,24 @@ build 流程：
 6. 后端开始录制 command buffer。
 7. 按 planned stream 录制 barrier 和普通 command。
 8. 结束后端录制。
-9. 保存 tracker transaction 和 waits，状态切换为 built。
+9. 丢弃 command vector，将 tracker transaction、lease 和 command buffer 移入 `BuiltRecorder`。
 
 build 成功不 commit tracker。只有 native submit 成功后才能 commit。
 
 build 失败：
 
 - tracker transaction rollback；
-- recorder 不可提交；
+- 不产生 `BuiltRecorder`，因此类型上不可提交；
 - command buffer 返回该 queue 的 unused；
 - 已部分录制的后端 command buffer 在下次使用前 reset。
 
-不允许对同一 recorder 重复 build。
+因为 build 消费 `self`，类型系统不允许重复 build，也不允许 build 后继续追加命令。
 
 ### 6.4 Drop
 
-recorder 在提交前被 drop 时：
+recording recorder 在 build 前被 drop，或 built recorder 在 submit 前被 drop 时：
 
-- tracker transaction（若存在）rollback；
+- built recorder 的 tracker transaction rollback；recording recorder 尚无 transaction；
 - command buffer 返回 originating queue 的 unused；
 - command buffer 不进入 pending；
 - 不访问全局 discard manager。
@@ -320,13 +336,13 @@ discard manager 不负责：
 
 ## 9. 并发模型
 
-同一个 queue 不允许同时存在多个 recorder。recorder 从创建开始持有 queue 独占 lease，直到以下任一事件：
+同一个 queue 不允许同时存在多个 recorder。lease 从 `Recorder` 创建开始持有，build 成功时转移给 `BuiltRecorder`，直到以下任一事件：
 
-- `queue.submit(recorder)` 消费 recorder；
-- recorder 被 drop；
-- build 失败后 recorder 完成清理并被 drop。
+- `queue.submit(built_recorder)` 消费 built recorder；
+- recording recorder 或 built recorder 被 drop；
+- build 失败，消费中的 recorder 自动完成清理。
 
-allocate、build、submit、flush、timeline value 分配与 command buffer 回收都受该独占模型串行化。`queue.submit(recorder)` 必须复用 recorder 已持有的 lease，不能再次锁定同一 queue。
+allocate、build、submit、flush、timeline value 分配与 command buffer 回收都受该独占模型串行化。`queue.submit(built_recorder)` 必须复用其已持有的 lease，不能再次锁定同一 queue。
 
 不同 queue 可以并行录制和提交，但共享 tracker 的 plan/commit/rollback 必须保持线程安全。
 
@@ -338,7 +354,7 @@ allocate、build、submit、flush、timeline value 分配与 command buffer 回�
 - 同一个 queue 同时最多存在一个 recorder。
 - 只有成功的 native submit 才能 commit tracker transaction。
 - manual release 的 barrier 位置与 command stream 中 release command 的位置一致。
-- recorder 只能提交到创建它的 queue。
+- 只有 `BuiltRecorder` 能提交，且只能提交到创建它的 queue。
 - queue drop 时不存在 GPU 仍在使用的 command buffer。
 - command buffer 永远不进入全局 discard manager。
 - `force_flush()` 回收但不销毁 command buffer。
@@ -347,7 +363,7 @@ allocate、build、submit、flush、timeline value 分配与 command buffer 回�
 
 1. `Queue` 是 trait；pool、unused 和 pending 是具体后端 queue 的私有字段。
 2. unused 与 pending 直接保存 `Arc<dyn RhiCommandBuffer>`。
-3. 提交入口固定为 `queue.submit(recorder)`。
+3. 提交入口固定为 `queue.submit(built_recorder)`。
 4. `submit()` 每次执行非阻塞 flush；`allocate()` 在 unused 为空时也先执行非阻塞 flush。
 5. 同一个 queue 不允许多个 recorder 并存；recorder 持有 queue 独占 lease。
 
