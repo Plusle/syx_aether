@@ -1,0 +1,6 @@
+/target
+/.idea
+/.codex
+
+# Machine-specific cargo env (e.g. LIBCLANG_PATH for shader-slang-sys bindgen)
+.cargo/

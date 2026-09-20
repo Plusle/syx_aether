@@ -1,0 +1,3 @@
+# Requires nightly rustfmt (cargo +nightly fmt).
+# Merge all `use` items from the same crate into a single block.
+imports_granularity = "Crate"

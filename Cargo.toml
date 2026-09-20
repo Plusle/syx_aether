@@ -1,0 +1,19 @@
+[package]
+name = "aether"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aether Team"]
+description = "Aether 3D modeling application (Rust prototype)"
+
+[dependencies]
+ash = "0.38"
+vma = { package = "vk-mem", version = "0.5" }
+shader-slang = "0.1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "std"] }
+thiserror = "2"
+bitflags = "2.13.1"
+num-traits = "0.2.19"
+colored = "3.1.1"
+chrono = "0.4.45"
+tracing-appender = "0.2.5"
