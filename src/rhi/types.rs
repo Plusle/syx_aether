@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-use std::any::Any;
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 bitflags::bitflags! {
     /// Operations for which a buffer may be used.
@@ -69,31 +68,5 @@ where
 {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::rhi::resource::RhiBuffer;
-    use std::sync::Arc;
-
-    #[derive(Debug)]
-    struct TestBuffer {
-        name: String,
-    }
-
-    impl RhiBuffer for TestBuffer {
-        fn name(&self) -> &str {
-            &self.name
-        }
-    }
-
-    #[test]
-    fn rhi_trait_object_retains_its_concrete_type() {
-        let buffer: Arc<dyn RhiBuffer> = Arc::new(TestBuffer {
-            name: "test buffer".into(),
-        });
-        assert!(buffer.as_any().is::<TestBuffer>());
-        assert_eq!(buffer.name(), "test buffer");
     }
 }

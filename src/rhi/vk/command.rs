@@ -7,16 +7,18 @@ use super::{
 };
 use crate::rhi::{
     command::{
-        BarrierDesc, BufferImageCopy, ClearValue, ImageAspect, ImageCopyRegion,
-        ImageSubresourceLayers, IndexType, LoadOp, Rect, RenderingDesc, RhiCommandBuffer, StoreOp,
-        Viewport,
+        BufferImageCopy, ClearValue, Command, ImageAspect, ImageCopyRegion, ImageSubresourceLayers,
+        IndexType, LoadOp, Rect, RenderingDesc, RhiCommandBuffer, StoreOp, Viewport,
     },
     descriptor::RhiDescriptorSet,
     pipeline::RhiPipeline,
-    resource::{RhiBuffer, RhiImage, RhiImageView},
+    resource::{
+        Access, ResourceRange, ResourceRef, ResourceState, RhiBuffer, RhiImage, RhiImageView,
+        Transition, TransitionKind,
+    },
     shader::ShaderStageFlags,
 };
-use ash::{vk, Device};
+use ash::vk;
 use std::fmt::{Debug, Formatter};
 
 /// A non-owning Vulkan command-buffer recorder.
@@ -25,11 +27,11 @@ use std::fmt::{Debug, Formatter};
 /// table for recording commands.
 pub(crate) struct VkCommandBuffer {
     handle: vk::CommandBuffer,
-    device: Device,
+    device: ash::Device,
 }
 
 impl VkCommandBuffer {
-    pub(crate) fn new(device: Device, handle: vk::CommandBuffer) -> Self {
+    pub(crate) fn new(device: ash::Device, handle: vk::CommandBuffer) -> Self {
         Self { handle, device }
     }
 
@@ -58,8 +60,73 @@ impl RhiCommandBuffer for VkCommandBuffer {
             .expect("failed to finish Vulkan command buffer");
     }
 
-    fn barrier(&mut self, _descs: &[BarrierDesc]) {
-        // BarrierDesc has no fields yet, so there is no native barrier to emit.
+    fn barrier(&mut self, descs: &[Transition<'_>]) {
+        let mut buffers = Vec::new();
+        let mut images = Vec::new();
+        for transition in descs {
+            let (mut src_stage, mut src_access) = transition
+                .before
+                .map(map_state)
+                .unwrap_or((vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE));
+            let (mut dst_stage, mut dst_access) = map_state(transition.after);
+            match transition.kind {
+                TransitionKind::Memory => {}
+                TransitionKind::Release => {
+                    dst_stage = vk::PipelineStageFlags2::NONE;
+                    dst_access = vk::AccessFlags2::NONE;
+                }
+                TransitionKind::Acquire => {
+                    src_stage = vk::PipelineStageFlags2::NONE;
+                    src_access = vk::AccessFlags2::NONE;
+                }
+            }
+            let src_queue_family_index = vk::QUEUE_FAMILY_IGNORED;
+            let dst_queue_family_index = vk::QUEUE_FAMILY_IGNORED;
+            match (transition.resource, transition.range) {
+                (ResourceRef::Buffer(buffer), ResourceRange::Buffer { offset, size }) => buffers
+                    .push(
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(src_stage)
+                            .src_access_mask(src_access)
+                            .dst_stage_mask(dst_stage)
+                            .dst_access_mask(dst_access)
+                            .src_queue_family_index(src_queue_family_index)
+                            .dst_queue_family_index(dst_queue_family_index)
+                            .buffer(buffer_handle(buffer))
+                            .offset(offset)
+                            .size(size),
+                    ),
+                (resource, ResourceRange::Image(range)) => images.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(src_stage)
+                        .src_access_mask(src_access)
+                        .dst_stage_mask(dst_stage)
+                        .dst_access_mask(dst_access)
+                        .old_layout(
+                            transition
+                                .before
+                                .map(map_image_layout)
+                                .unwrap_or(vk::ImageLayout::UNDEFINED),
+                        )
+                        .new_layout(map_image_layout(transition.after))
+                        .src_queue_family_index(src_queue_family_index)
+                        .dst_queue_family_index(dst_queue_family_index)
+                        .image(resource_image_handle(resource))
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: map_aspect(range.aspect),
+                            base_mip_level: range.base_mip,
+                            level_count: range.mip_count,
+                            base_array_layer: range.base_layer,
+                            layer_count: range.layer_count,
+                        }),
+                ),
+                _ => unreachable!("resource reference and range kinds must match"),
+            }
+        }
+        let dependency = vk::DependencyInfo::default()
+            .buffer_memory_barriers(&buffers)
+            .image_memory_barriers(&images);
+        unsafe { self.device.cmd_pipeline_barrier2(self.handle, &dependency) };
     }
 
     fn begin_rendering(&mut self, desc: &RenderingDesc<'_>) {
@@ -407,6 +474,97 @@ impl RhiCommandBuffer for VkCommandBuffer {
     fn insert_debug_label(&mut self, _name: &str) {}
 }
 
+fn record_command(buffer: &mut dyn RhiCommandBuffer, command: Command<'_>) {
+    match command {
+        Command::BeginRendering(desc) => buffer.begin_rendering(&desc),
+        Command::EndRendering => buffer.end_rendering(),
+        Command::Draw {
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+        } => buffer.draw(vertex_count, instance_count, first_vertex, first_instance),
+        Command::DrawIndexed {
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+        } => buffer.draw_indexed(
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+        ),
+        Command::DrawIndirect {
+            buffer: resource,
+            offset,
+            draw_count,
+            stride,
+        } => buffer.draw_indirect(resource, offset, draw_count, stride),
+        Command::DrawIndexedIndirect {
+            buffer: resource,
+            offset,
+            draw_count,
+            stride,
+        } => buffer.draw_indexed_indirect(resource, offset, draw_count, stride),
+        Command::Dispatch(count) => buffer.dispatch(count),
+        Command::DispatchIndirect {
+            buffer: resource,
+            offset,
+        } => buffer.dispatch_indirect(resource, offset),
+        Command::CopyBuffer {
+            src,
+            src_offset,
+            dst,
+            dst_offset,
+            size,
+        } => buffer.copy_buffer(src, src_offset, dst, dst_offset, size),
+        Command::CopyBufferToImage { src, dst, region } => {
+            buffer.copy_buffer_to_image(src, dst, &region)
+        }
+        Command::CopyImageToBuffer { src, dst, region } => {
+            buffer.copy_image_to_buffer(src, dst, &region)
+        }
+        Command::CopyImage {
+            src,
+            src_region,
+            dst,
+            dst_region,
+            extent,
+        } => buffer.copy_image(src, &src_region, dst, &dst_region, extent),
+        Command::ReleaseBuffers { .. } | Command::ReleaseImages { .. } => {
+            unreachable!("release commands are consumed by the resource planner")
+        }
+        Command::BindPipeline(pipeline) => buffer.bind_pipeline(pipeline),
+        Command::BindVertexBuffers { first, buffers } => buffer.bind_vertex_buffers(first, buffers),
+        Command::BindIndexBuffer {
+            buffer: resource,
+            offset,
+            index_type,
+        } => buffer.bind_index_buffer(resource, offset, index_type),
+        Command::BindDescriptorSets {
+            pipeline,
+            first_set,
+            sets,
+        } => buffer.bind_descriptor_sets(pipeline, first_set, sets),
+        Command::PushConstants {
+            pipeline,
+            stages,
+            offset,
+            data,
+        } => buffer.push_constants(pipeline, stages, offset, data),
+        Command::SetViewport(viewport) => buffer.set_viewport(&viewport),
+        Command::SetScissor(scissor) => buffer.set_scissor(&scissor),
+        Command::SetBlendConstants(constants) => buffer.set_blend_constants(constants),
+        Command::SetStencilReference(reference) => buffer.set_stencil_reference(reference),
+        Command::BeginDebugLabel(name) => buffer.begin_debug_label(name),
+        Command::EndDebugLabel => buffer.end_debug_label(),
+        Command::InsertDebugLabel(name) => buffer.insert_debug_label(name),
+    }
+}
+
 fn buffer_handle(buffer: &dyn RhiBuffer) -> vk::Buffer {
     buffer
         .as_any()
@@ -426,6 +584,79 @@ fn image_view(view: &dyn RhiImageView) -> &VkImageView {
     view.as_any()
         .downcast_ref::<VkImageView>()
         .expect("Vulkan command buffer received a non-Vulkan image view")
+}
+
+fn resource_image_handle(resource: ResourceRef<'_>) -> vk::Image {
+    match resource {
+        ResourceRef::Image(image) => self::image(image).handle(),
+        ResourceRef::ImageView(view) => image_view(view).image_handle,
+        ResourceRef::Buffer(_) => {
+            unreachable!("buffer cannot back an image transition")
+        }
+    }
+}
+
+fn map_state(state: ResourceState) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    match state.access {
+        Access::VertexRead => (
+            vk::PipelineStageFlags2::VERTEX_INPUT,
+            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+        ),
+        Access::IndexRead => (
+            vk::PipelineStageFlags2::INDEX_INPUT,
+            vk::AccessFlags2::INDEX_READ,
+        ),
+        Access::IndirectRead => (
+            vk::PipelineStageFlags2::DRAW_INDIRECT,
+            vk::AccessFlags2::INDIRECT_COMMAND_READ,
+        ),
+        Access::TransferRead => (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        ),
+        Access::TransferWrite => (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        ),
+        Access::ShaderRead => (
+            vk::PipelineStageFlags2::ALL_GRAPHICS | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        ),
+        Access::ShaderWrite => (
+            vk::PipelineStageFlags2::ALL_GRAPHICS | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
+        ),
+        Access::ColorAttachmentReadWrite => (
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        ),
+        Access::DepthStencilReadWrite => (
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
+    }
+}
+
+fn map_image_layout(state: ResourceState) -> vk::ImageLayout {
+    match state.access {
+        Access::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        Access::TransferWrite => vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        Access::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        Access::ShaderWrite => vk::ImageLayout::GENERAL,
+        Access::ColorAttachmentReadWrite => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        Access::DepthStencilReadWrite => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        Access::VertexRead | Access::IndexRead | Access::IndirectRead => vk::ImageLayout::GENERAL,
+    }
+}
+
+fn map_aspect(aspect: ImageAspect) -> vk::ImageAspectFlags {
+    match aspect {
+        ImageAspect::Color => vk::ImageAspectFlags::COLOR,
+        ImageAspect::Depth => vk::ImageAspectFlags::DEPTH,
+        ImageAspect::Stencil => vk::ImageAspectFlags::STENCIL,
+    }
 }
 
 fn vk_pipeline(pipeline: &dyn RhiPipeline) -> &VkPipeline {

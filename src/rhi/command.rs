@@ -1,24 +1,14 @@
+#![allow(dead_code)]
+
 use crate::rhi::{
     descriptor::RhiDescriptorSet,
     pipeline::RhiPipeline,
-    resource::{RhiBuffer, RhiImage, RhiImageView},
+    resource::{QueueKind, RhiBuffer, RhiImage, RhiImageView, Transition},
     shader::ShaderStageFlags,
     types::RhiType,
 };
 
-/// An image aspect selected by an image operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ImageAspect {
-    Color,
-    Depth,
-    Stencil,
-}
-
-/// One tracker-produced resource barrier.
-///
-/// The tracker state will be added here when that subsystem is introduced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BarrierDesc;
+pub use crate::rhi::resource::ImageAspect;
 
 /// One color attachment of a dynamic rendering pass.
 #[derive(Debug, Clone, Copy)]
@@ -123,8 +113,105 @@ pub enum IndexType {
     U32,
 }
 
+/// A backend-neutral command description.
+#[derive(Debug, Clone, Copy)]
+pub enum Command<'a> {
+    BeginRendering(RenderingDesc<'a>),
+    EndRendering,
+    Draw {
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    },
+    DrawIndexed {
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    },
+    DrawIndirect {
+        buffer: &'a dyn RhiBuffer,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    },
+    DrawIndexedIndirect {
+        buffer: &'a dyn RhiBuffer,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    },
+    Dispatch([u32; 3]),
+    DispatchIndirect {
+        buffer: &'a dyn RhiBuffer,
+        offset: u64,
+    },
+    CopyBuffer {
+        src: &'a dyn RhiBuffer,
+        src_offset: u64,
+        dst: &'a dyn RhiBuffer,
+        dst_offset: u64,
+        size: u64,
+    },
+    CopyBufferToImage {
+        src: &'a dyn RhiBuffer,
+        dst: &'a dyn RhiImage,
+        region: BufferImageCopy,
+    },
+    CopyImageToBuffer {
+        src: &'a dyn RhiImage,
+        dst: &'a dyn RhiBuffer,
+        region: BufferImageCopy,
+    },
+    CopyImage {
+        src: &'a dyn RhiImage,
+        src_region: ImageCopyRegion,
+        dst: &'a dyn RhiImage,
+        dst_region: ImageCopyRegion,
+        extent: [u32; 3],
+    },
+    ReleaseBuffers {
+        buffers: &'a [&'a dyn RhiBuffer],
+        target: QueueKind,
+    },
+    ReleaseImages {
+        images: &'a [&'a dyn RhiImage],
+        target: QueueKind,
+    },
+    BindPipeline(&'a dyn RhiPipeline),
+    BindVertexBuffers {
+        first: u32,
+        buffers: &'a [(&'a dyn RhiBuffer, u64)],
+    },
+    BindIndexBuffer {
+        buffer: &'a dyn RhiBuffer,
+        offset: u64,
+        index_type: IndexType,
+    },
+    BindDescriptorSets {
+        pipeline: &'a dyn RhiPipeline,
+        first_set: u32,
+        sets: &'a [&'a dyn RhiDescriptorSet],
+    },
+    PushConstants {
+        pipeline: &'a dyn RhiPipeline,
+        stages: ShaderStageFlags,
+        offset: u32,
+        data: &'a [u8],
+    },
+    SetViewport(Viewport),
+    SetScissor(Rect),
+    SetBlendConstants([f32; 4]),
+    SetStencilReference(u32),
+    BeginDebugLabel(&'a str),
+    EndDebugLabel,
+    InsertDebugLabel(&'a str),
+}
+
 /// Backend implementation of a command buffer.
-pub trait RhiCommandBuffer: RhiType {
+pub(crate) trait RhiCommandBuffer: RhiType {
     /// Begin recording.
     fn begin(&mut self);
 
@@ -133,8 +220,8 @@ pub trait RhiCommandBuffer: RhiType {
 
     /// Record one native barrier from tracker-derived descs.
     /// Crate-internal contract: only the recorder calls this, with the
-    /// `BarrierDesc` list returned by `Tracker::transition`.
-    fn barrier(&mut self, descs: &[BarrierDesc]);
+    /// transition list produced by `ResourceTracker::plan`.
+    fn barrier(&mut self, descs: &[Transition<'_>]);
 
     /// Begin a dynamic rendering pass.
     fn begin_rendering(&mut self, desc: &RenderingDesc<'_>);

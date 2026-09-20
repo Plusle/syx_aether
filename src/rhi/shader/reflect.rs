@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Backend-neutral shader reflection: abstract types plus extraction from a
 //! linked Slang program layout. The only external dependency here is the
 //! compiler's reflection API; nothing is backend-specific.
@@ -409,7 +410,6 @@ pub(crate) fn extract(
 /// (set, binding) with duplicate keys collapsed.
 // Not yet used outside tests: per-module composition lands with the
 // pipeline model.
-#[allow(dead_code)]
 pub(crate) fn merge(dst: &mut ShaderReflection, src: ShaderReflection) {
     for binding in src.bindings {
         match dst

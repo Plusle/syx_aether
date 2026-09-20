@@ -1,18 +1,25 @@
 #![allow(dead_code)]
 
-use super::resource::{VkBuffer, VkImage, VkImageView, VkSampler};
-use super::{allocator::Allocator, instance::Instance};
+use super::{
+    allocator::Allocator,
+    instance::Instance,
+    resource::{VkBuffer, VkImage, VkImageView, VkSampler},
+};
 use crate::rhi::{
     backend::RhiBackend,
     error::{RhiError, RhiResult},
-    resource::{RhiBuffer, RhiImage, RhiImageView, RhiSampler},
+    resource::{ResourceTracker, RhiBuffer, RhiImage, RhiImageView, RhiSampler},
     sync::SyncPoint,
     types::{BufferDesc, ImageDesc, ImageViewDesc, SamplerDesc},
 };
 use ash::{vk, vk::Handle};
-use std::collections::HashSet;
-use std::fmt::{Debug, Formatter};
-use std::{ffi::CStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    ffi::CStr,
+    fmt::{Debug, Formatter},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tracing::{info, warn};
 
 pub struct Device {
@@ -20,8 +27,18 @@ pub struct Device {
     _instance: Arc<Instance>,
     pub device: ash::Device,
     pub graphics_queue_family: u32,
+    pub transfer_queue_family: u32,
+    pub transfer_queue_index: u32,
     pub buffer_device_address: bool,
     allocator: Option<Allocator>,
+    pub(crate) tracker: Arc<ResourceTracker>,
+    discarded_buffers: Mutex<Vec<DiscardedBuffer>>,
+}
+
+struct DiscardedBuffer {
+    id: crate::rhi::resource::ResourceId,
+    handle: vk::Buffer,
+    allocation: vma::Allocation,
 }
 
 impl Device {
@@ -53,6 +70,21 @@ impl Device {
                     continue;
                 }
             };
+            let transfer_family = queue_families
+                .iter()
+                .position(|family| {
+                    family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                        && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                })
+                .map(|index| index as u32)
+                .unwrap_or(graphics_family);
+            let transfer_index = if transfer_family == graphics_family
+                && queue_families[graphics_family as usize].queue_count > 1
+            {
+                1
+            } else {
+                0
+            };
 
             // Timeline semaphores are the synchronization backbone; GPUs
             // without them cannot run this backend.
@@ -69,9 +101,14 @@ impl Device {
                 );
                 continue;
             }
-            if props.api_version < vk::API_VERSION_1_3 || features13.dynamic_rendering == vk::FALSE
+            if props.api_version < vk::API_VERSION_1_3
+                || features13.dynamic_rendering == vk::FALSE
+                || features13.synchronization2 == vk::FALSE
             {
-                warn!("Skipping {}: dynamic rendering not supported", device_name);
+                warn!(
+                    "Skipping {}: Vulkan 1.3 dynamic rendering/synchronization2 not supported",
+                    device_name
+                );
                 continue;
             }
 
@@ -79,23 +116,44 @@ impl Device {
             selected = Some((
                 physical_device,
                 graphics_family,
+                transfer_family,
+                transfer_index,
                 device_name,
                 features12.buffer_device_address == vk::TRUE,
             ));
             break;
         }
 
-        let (physical_device, graphics_family, _device_name, buffer_device_address) =
-            selected.ok_or(RhiError::BackendError("No suitable GPU found".into()))?;
+        let (
+            physical_device,
+            graphics_family,
+            transfer_family,
+            transfer_index,
+            _device_name,
+            buffer_device_address,
+        ) = selected.ok_or(RhiError::BackendError("No suitable GPU found".into()))?;
 
-        let priorities = [1.0f32];
-        let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(graphics_family)
-            .queue_priorities(&priorities)];
+        let priorities = [1.0f32, 1.0];
+        let queue_create_infos = if transfer_family == graphics_family {
+            vec![vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(graphics_family)
+                .queue_priorities(&priorities[..=(transfer_index as usize)])]
+        } else {
+            vec![
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(graphics_family)
+                    .queue_priorities(&priorities[..1]),
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(transfer_family)
+                    .queue_priorities(&priorities[..1]),
+            ]
+        };
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(true)
             .buffer_device_address(buffer_device_address);
-        let mut features13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .synchronization2(true);
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .push_next(&mut features12)
@@ -115,8 +173,12 @@ impl Device {
             _instance: instance,
             device,
             graphics_queue_family: graphics_family,
+            transfer_queue_family: transfer_family,
+            transfer_queue_index: transfer_index,
             buffer_device_address,
             allocator: Some(allocator),
+            tracker: Arc::new(ResourceTracker::new()),
+            discarded_buffers: Mutex::new(Vec::new()),
         })
     }
 
@@ -125,10 +187,62 @@ impl Device {
             .as_ref()
             .expect("Vulkan allocator must exist while Device is alive")
     }
+
+    pub(crate) fn defer_buffer(
+        &self,
+        id: crate::rhi::resource::ResourceId,
+        handle: vk::Buffer,
+        allocation: vma::Allocation,
+    ) {
+        self.tracker.retire(id);
+        self.discarded_buffers
+            .lock()
+            .expect("discard pool poisoned")
+            .push(DiscardedBuffer {
+                id,
+                handle,
+                allocation,
+            });
+    }
+
+    pub fn collect_garbage(&self) {
+        let mut discarded = self
+            .discarded_buffers
+            .lock()
+            .expect("discard pool poisoned");
+        let mut index = 0;
+        while index < discarded.len() {
+            let ready = self.tracker.can_destroy(discarded[index].id, |point| {
+                let semaphore = vk::Semaphore::from_raw(point.timeline());
+                unsafe { self.device.get_semaphore_counter_value(semaphore) }
+                    .is_ok_and(|completed| completed >= point.value())
+            });
+            if ready {
+                let mut buffer = discarded.swap_remove(index);
+                self.allocator()
+                    .destroy_buffer(buffer.handle, &mut buffer.allocation);
+                self.tracker.forget(buffer.id);
+            } else {
+                index += 1;
+            }
+        }
+    }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        let discarded = std::mem::take(
+            self.discarded_buffers
+                .get_mut()
+                .expect("discard pool poisoned"),
+        );
+        for mut buffer in discarded {
+            self.allocator()
+                .destroy_buffer(buffer.handle, &mut buffer.allocation);
+        }
         // The allocator owns Vulkan memory blocks and must release them while
         // the logical device is still alive.
         let allocator = self.allocator.take();
@@ -147,11 +261,15 @@ pub struct VulkanDevice {
 }
 
 impl VulkanDevice {
-    pub fn new(ctx: Device) -> Self {
-        Self {
+    pub fn new(ctx: Device) -> RhiResult<Self> {
+        Ok(Self {
             ctx: Arc::new(ctx),
             timelines: HashSet::new(),
-        }
+        })
+    }
+
+    pub fn collect_garbage(&self) {
+        self.ctx.collect_garbage();
     }
 }
 

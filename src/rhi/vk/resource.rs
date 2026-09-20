@@ -3,7 +3,7 @@
 use super::device::Device;
 use crate::rhi::{
     error::{RhiError, RhiResult},
-    resource::{RhiBuffer, RhiImage, RhiImageView, RhiSampler},
+    resource::{ImageSubresourceRange, ResourceId, RhiBuffer, RhiImage, RhiImageView, RhiSampler},
     types::{BufferDesc, BufferUsage, CpuAccess},
 };
 use ash::vk;
@@ -14,8 +14,10 @@ use std::{
 use vma::{Allocation, AllocationCreateFlags, AllocationCreateInfo, MemoryUsage};
 
 pub(crate) struct VkBuffer {
+    id: ResourceId,
     ctx: Arc<Device>,
     name: String,
+    size: u64,
     handle: vk::Buffer,
     allocation: Option<Allocation>,
 }
@@ -72,8 +74,10 @@ impl VkBuffer {
             .create_buffer(&create_info, &allocation_info)?;
 
         Ok(Self {
+            id: ResourceId::allocate(),
             ctx,
             name: desc.name,
+            size: desc.size,
             handle,
             allocation: Some(allocation),
         })
@@ -94,17 +98,23 @@ impl Debug for VkBuffer {
 }
 
 impl RhiBuffer for VkBuffer {
+    fn id(&self) -> ResourceId {
+        self.id
+    }
+
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn size(&self) -> u64 {
+        self.size
     }
 }
 
 impl Drop for VkBuffer {
     fn drop(&mut self) {
-        if let Some(mut allocation) = self.allocation.take() {
-            self.ctx
-                .allocator()
-                .destroy_buffer(self.handle, &mut allocation);
+        if let Some(allocation) = self.allocation.take() {
+            self.ctx.defer_buffer(self.id, self.handle, allocation);
         }
     }
 }
@@ -171,6 +181,7 @@ mod tests {
 
 #[derive(Debug)]
 pub(crate) struct VkImage {
+    pub(crate) id: ResourceId,
     pub(crate) handle: vk::Image,
 }
 
@@ -180,7 +191,11 @@ impl VkImage {
     }
 }
 
-impl RhiImage for VkImage {}
+impl RhiImage for VkImage {
+    fn id(&self) -> ResourceId {
+        self.id
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct VkSampler {}
@@ -189,6 +204,9 @@ impl RhiSampler for VkSampler {}
 
 #[derive(Debug)]
 pub(crate) struct VkImageView {
+    pub(crate) image_id: ResourceId,
+    pub(crate) image_handle: vk::Image,
+    pub(crate) range: ImageSubresourceRange,
     pub(crate) handle: vk::ImageView,
 }
 
@@ -198,4 +216,12 @@ impl VkImageView {
     }
 }
 
-impl RhiImageView for VkImageView {}
+impl RhiImageView for VkImageView {
+    fn image_id(&self) -> ResourceId {
+        self.image_id
+    }
+
+    fn subresource_range(&self) -> ImageSubresourceRange {
+        self.range
+    }
+}

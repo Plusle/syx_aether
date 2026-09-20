@@ -6,8 +6,7 @@ use crate::rhi::{
     sync::SyncPoint,
     types::{BufferDesc, ImageDesc, ImageViewDesc, RhiType, SamplerDesc},
 };
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 pub enum BackendType {
     Vulkan,
@@ -24,7 +23,7 @@ pub fn bootstrap(t: BackendType) -> Result<(), RhiError> {
 
 pub fn terminate() {}
 
-pub trait RhiBackend: RhiType {
+pub(crate) trait RhiBackend: RhiType {
     fn create_buffer(&self, desc: BufferDesc) -> RhiResult<Arc<dyn RhiBuffer>>;
     fn create_image(&self, desc: ImageDesc) -> RhiResult<Arc<dyn RhiImage>>;
     fn create_sampler(&self, desc: SamplerDesc) -> RhiResult<Arc<dyn RhiSampler>>;
