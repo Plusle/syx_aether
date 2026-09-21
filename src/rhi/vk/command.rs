@@ -1,24 +1,24 @@
 #![allow(dead_code)]
 
-use super::{
-    descriptor::VkDescriptorSet,
-    pipeline::VkPipeline,
-    queue::VkQueueRegistry,
-    resource::{VkBuffer, VkImage, VkImageView},
-};
 use crate::rhi::{
     command::{
         BufferImageCopy, ClearValue, ImageAspect, ImageCopyRegion, ImageSubresourceLayers,
         IndexType, LoadOp, Rect, RenderingDesc, RhiCommandBuffer, StoreOp, Viewport,
     },
-    descriptor::RhiDescriptorSet,
+    descriptor::{DescriptorSet, RhiDescriptorSet},
     error::RhiResult,
-    pipeline::RhiPipeline,
+    pipeline::{Pipeline, RhiPipeline},
     resource::{
-        Access, ResourceRange, ResourceRef, ResourceState, RhiBuffer, RhiImage, RhiImageView,
-        Transition, TransitionKind,
+        Access, Buffer, Image, ImageView, ResourceRange, ResourceRef, ResourceState, RhiBuffer,
+        RhiImage, RhiImageView, Transition, TransitionKind,
     },
     shader::ShaderStageFlags,
+    vk::{
+        descriptor::VkDescriptorSet,
+        pipeline::VkPipeline,
+        queue::VkQueueRegistry,
+        resource::{VkBuffer, VkImage, VkImageView},
+    },
 };
 use ash::vk;
 use std::{
@@ -148,11 +148,11 @@ impl RhiCommandBuffer for VkCommandBuffer {
                         .dst_queue_family_index(dst_queue_family_index)
                         .image(resource_image_handle(resource))
                         .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: map_aspect(range.aspect),
-                            base_mip_level: range.base_mip,
-                            level_count: range.mip_count,
-                            base_array_layer: range.base_layer,
-                            layer_count: range.layer_count,
+                            aspect_mask: map_aspect(range.aspect()),
+                            base_mip_level: range.base_mip(),
+                            level_count: range.mip_count(),
+                            base_array_layer: range.base_layer(),
+                            layer_count: range.layer_count(),
                         }),
                 ),
                 _ => unreachable!("resource reference and range kinds must match"),
@@ -170,7 +170,7 @@ impl RhiCommandBuffer for VkCommandBuffer {
             .iter()
             .map(|attachment| {
                 let mut info = vk::RenderingAttachmentInfo::default()
-                    .image_view(image_view(attachment.view).handle())
+                    .image_view(image_view(attachment.view.inner()).handle())
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(map_load_op(attachment.load_op))
                     .store_op(map_store_op(attachment.store_op))
@@ -178,7 +178,7 @@ impl RhiCommandBuffer for VkCommandBuffer {
                 if let Some(resolve) = attachment.resolve {
                     info = info
                         .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                        .resolve_image_view(image_view(resolve).handle())
+                        .resolve_image_view(image_view(resolve.inner()).handle())
                         .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
                 }
                 info
@@ -187,16 +187,16 @@ impl RhiCommandBuffer for VkCommandBuffer {
 
         let depth = desc.depth_stencil.map(|attachment| {
             depth_stencil_attachment(
-                attachment.view,
-                attachment.resolve,
+                attachment.view.inner(),
+                attachment.resolve.map(ImageView::inner),
                 attachment.depth_load_op,
                 attachment.depth_store_op,
             )
         });
         let stencil = desc.depth_stencil.map(|attachment| {
             depth_stencil_attachment(
-                attachment.view,
-                attachment.resolve,
+                attachment.view.inner(),
+                attachment.resolve.map(ImageView::inner),
                 attachment.stencil_load_op,
                 attachment.stencil_store_op,
             )
@@ -263,11 +263,11 @@ impl RhiCommandBuffer for VkCommandBuffer {
         };
     }
 
-    fn draw_indirect(&mut self, buffer: &dyn RhiBuffer, offset: u64, draw_count: u32, stride: u32) {
+    fn draw_indirect(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32) {
         unsafe {
             self.device.cmd_draw_indirect(
                 self.handle,
-                buffer_handle(buffer),
+                buffer_handle(buffer.inner()),
                 offset,
                 draw_count,
                 stride,
@@ -277,7 +277,7 @@ impl RhiCommandBuffer for VkCommandBuffer {
 
     fn draw_indexed_indirect(
         &mut self,
-        buffer: &dyn RhiBuffer,
+        buffer: &Buffer,
         offset: u64,
         draw_count: u32,
         stride: u32,
@@ -285,7 +285,7 @@ impl RhiCommandBuffer for VkCommandBuffer {
         unsafe {
             self.device.cmd_draw_indexed_indirect(
                 self.handle,
-                buffer_handle(buffer),
+                buffer_handle(buffer.inner()),
                 offset,
                 draw_count,
                 stride,
@@ -300,18 +300,18 @@ impl RhiCommandBuffer for VkCommandBuffer {
         };
     }
 
-    fn dispatch_indirect(&mut self, buffer: &dyn RhiBuffer, offset: u64) {
+    fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64) {
         unsafe {
             self.device
-                .cmd_dispatch_indirect(self.handle, buffer_handle(buffer), offset)
+                .cmd_dispatch_indirect(self.handle, buffer_handle(buffer.inner()), offset)
         };
     }
 
     fn copy_buffer(
         &mut self,
-        src: &dyn RhiBuffer,
+        src: &Buffer,
         src_offset: u64,
-        dst: &dyn RhiBuffer,
+        dst: &Buffer,
         dst_offset: u64,
         size: u64,
     ) {
@@ -322,42 +322,32 @@ impl RhiCommandBuffer for VkCommandBuffer {
         unsafe {
             self.device.cmd_copy_buffer(
                 self.handle,
-                buffer_handle(src),
-                buffer_handle(dst),
+                buffer_handle(src.inner()),
+                buffer_handle(dst.inner()),
                 &[region],
             )
         };
     }
 
-    fn copy_buffer_to_image(
-        &mut self,
-        src: &dyn RhiBuffer,
-        dst: &dyn RhiImage,
-        region: &BufferImageCopy,
-    ) {
+    fn copy_buffer_to_image(&mut self, src: &Buffer, dst: &Image, region: &BufferImageCopy) {
         unsafe {
             self.device.cmd_copy_buffer_to_image(
                 self.handle,
-                buffer_handle(src),
-                image(dst).handle(),
+                buffer_handle(src.inner()),
+                image(dst.inner()).handle(),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[map_buffer_image_copy(region)],
             )
         };
     }
 
-    fn copy_image_to_buffer(
-        &mut self,
-        src: &dyn RhiImage,
-        dst: &dyn RhiBuffer,
-        region: &BufferImageCopy,
-    ) {
+    fn copy_image_to_buffer(&mut self, src: &Image, dst: &Buffer, region: &BufferImageCopy) {
         unsafe {
             self.device.cmd_copy_image_to_buffer(
                 self.handle,
-                image(src).handle(),
+                image(src.inner()).handle(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                buffer_handle(dst),
+                buffer_handle(dst.inner()),
                 &[map_buffer_image_copy(region)],
             )
         };
@@ -365,9 +355,9 @@ impl RhiCommandBuffer for VkCommandBuffer {
 
     fn copy_image(
         &mut self,
-        src: &dyn RhiImage,
+        src: &Image,
         src_region: &ImageCopyRegion,
-        dst: &dyn RhiImage,
+        dst: &Image,
         dst_region: &ImageCopyRegion,
         extent: [u32; 3],
     ) {
@@ -384,27 +374,27 @@ impl RhiCommandBuffer for VkCommandBuffer {
         unsafe {
             self.device.cmd_copy_image(
                 self.handle,
-                image(src).handle(),
+                image(src.inner()).handle(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                image(dst).handle(),
+                image(dst.inner()).handle(),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[region],
             )
         };
     }
 
-    fn bind_pipeline(&mut self, pipeline: &dyn RhiPipeline) {
-        let pipeline = vk_pipeline(pipeline);
+    fn bind_pipeline(&mut self, pipeline: &Pipeline) {
+        let pipeline = vk_pipeline(pipeline.inner());
         unsafe {
             self.device
                 .cmd_bind_pipeline(self.handle, pipeline.bind_point, pipeline.handle)
         };
     }
 
-    fn bind_vertex_buffers(&mut self, first: u32, buffers: &[(&dyn RhiBuffer, u64)]) {
+    fn bind_vertex_buffers(&mut self, first: u32, buffers: &[(&Buffer, u64)]) {
         let handles: Vec<_> = buffers
             .iter()
-            .map(|(buffer, _)| buffer_handle(*buffer))
+            .map(|(buffer, _)| buffer_handle(buffer.inner()))
             .collect();
         let offsets: Vec<_> = buffers.iter().map(|(_, offset)| *offset).collect();
         unsafe {
@@ -413,25 +403,32 @@ impl RhiCommandBuffer for VkCommandBuffer {
         };
     }
 
-    fn bind_index_buffer(&mut self, buffer: &dyn RhiBuffer, offset: u64, ty: IndexType) {
+    fn bind_index_buffer(&mut self, buffer: &Buffer, offset: u64, ty: IndexType) {
         let ty = match ty {
             IndexType::U16 => vk::IndexType::UINT16,
             IndexType::U32 => vk::IndexType::UINT32,
         };
         unsafe {
-            self.device
-                .cmd_bind_index_buffer(self.handle, buffer_handle(buffer), offset, ty)
+            self.device.cmd_bind_index_buffer(
+                self.handle,
+                buffer_handle(buffer.inner()),
+                offset,
+                ty,
+            )
         };
     }
 
     fn bind_descriptor_sets(
         &mut self,
-        pipeline: &dyn RhiPipeline,
+        pipeline: &Pipeline,
         first_set: u32,
-        sets: &[&dyn RhiDescriptorSet],
+        sets: &[&DescriptorSet],
     ) {
-        let pipeline = vk_pipeline(pipeline);
-        let sets: Vec<_> = sets.iter().map(|set| descriptor_set(*set).handle).collect();
+        let pipeline = vk_pipeline(pipeline.inner());
+        let sets: Vec<_> = sets
+            .iter()
+            .map(|set| descriptor_set(set.inner()).handle)
+            .collect();
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 self.handle,
@@ -446,7 +443,7 @@ impl RhiCommandBuffer for VkCommandBuffer {
 
     fn push_constants(
         &mut self,
-        pipeline: &dyn RhiPipeline,
+        pipeline: &Pipeline,
         stages: ShaderStageFlags,
         offset: u32,
         data: &[u8],
@@ -454,7 +451,7 @@ impl RhiCommandBuffer for VkCommandBuffer {
         unsafe {
             self.device.cmd_push_constants(
                 self.handle,
-                vk_pipeline(pipeline).layout,
+                vk_pipeline(pipeline.inner()).layout,
                 map_shader_stages(stages),
                 offset,
                 data,
@@ -510,6 +507,11 @@ impl RhiCommandBuffer for VkCommandBuffer {
 }
 
 fn buffer_handle(buffer: &dyn RhiBuffer) -> vk::Buffer {
+    let buffer = buffer
+        .as_any()
+        .downcast_ref::<Buffer>()
+        .map(Buffer::inner)
+        .unwrap_or(buffer);
     buffer
         .as_any()
         .downcast_ref::<VkBuffer>()
@@ -518,6 +520,11 @@ fn buffer_handle(buffer: &dyn RhiBuffer) -> vk::Buffer {
 }
 
 fn image(image: &dyn RhiImage) -> &VkImage {
+    let image = image
+        .as_any()
+        .downcast_ref::<Image>()
+        .map(Image::inner)
+        .unwrap_or(image);
     image
         .as_any()
         .downcast_ref::<VkImage>()
@@ -525,6 +532,11 @@ fn image(image: &dyn RhiImage) -> &VkImage {
 }
 
 fn image_view(view: &dyn RhiImageView) -> &VkImageView {
+    let view = view
+        .as_any()
+        .downcast_ref::<ImageView>()
+        .map(ImageView::inner)
+        .unwrap_or(view);
     view.as_any()
         .downcast_ref::<VkImageView>()
         .expect("Vulkan command buffer received a non-Vulkan image view")
@@ -533,7 +545,6 @@ fn image_view(view: &dyn RhiImageView) -> &VkImageView {
 fn resource_image_handle(resource: ResourceRef<'_>) -> vk::Image {
     match resource {
         ResourceRef::Image(image) => self::image(image).handle(),
-        ResourceRef::ImageView(view) => image_view(view).image_handle,
         ResourceRef::Buffer(_) => {
             unreachable!("buffer cannot back an image transition")
         }

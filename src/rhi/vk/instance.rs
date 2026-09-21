@@ -1,8 +1,7 @@
-use crate::rhi::error::RhiError;
+use crate::{rhi::error::RhiError, util::log};
 
 use ash::{ext::debug_utils, vk, Entry};
 use std::ffi::{c_void, CStr, CString};
-use tracing::{debug, error, info, warn};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
@@ -85,7 +84,7 @@ impl Instance {
 
             unsafe { entry.create_instance(&create_info, None)? }
         };
-        info!(
+        log::info!(
             "Vulkan instance created (validation = {})",
             enable_validation
         );
@@ -106,7 +105,7 @@ impl Instance {
                 .pfn_user_callback(Some(debug_callback));
 
             let messenger = unsafe { utils.create_debug_utils_messenger(&messenger_info, None)? };
-            debug!("Debug messenger created");
+            log::debug!("Debug messenger created");
             (Some(utils), Some(messenger))
         } else {
             (None, None)
@@ -128,10 +127,10 @@ impl Drop for Instance {
                 (self.debug_utils.as_ref(), self.debug_messenger)
             {
                 utils.destroy_debug_utils_messenger(messenger, None);
-                debug!("Debug messenger destroyed");
+                log::debug!("Debug messenger destroyed");
             }
             self.instance.destroy_instance(None);
-            info!("Vulkan instance destroyed");
+            log::info!("Vulkan instance destroyed");
         }
     }
 }
@@ -182,7 +181,7 @@ unsafe extern "system" fn debug_callback(
     let object_handles: Vec<u64> = objects.iter().map(|o| o.object_handle).collect();
 
     if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
-        error!(
+        log::error!(
             target: "vulkan_validation",
             "[{:?}] {} | labels: {:?} | objects: {:?}",
             message_type,
@@ -191,7 +190,7 @@ unsafe extern "system" fn debug_callback(
             object_handles,
         );
     } else if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
-        warn!(
+        log::warn!(
             target: "vulkan_validation",
             "[{:?}] {} | labels: {:?} | objects: {:?}",
             message_type,
@@ -200,7 +199,7 @@ unsafe extern "system" fn debug_callback(
             object_handles,
         );
     } else {
-        info!(
+        log::info!(
             target: "vulkan_validation",
             "[{:?}] {} | labels: {:?} | objects: {:?}",
             message_type,

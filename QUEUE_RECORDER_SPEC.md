@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-本设计定义 queue、recorder、command buffer、资源状态 tracker 和 discard manager 之间的职责与生命周期。
+本设计定义 queue、recorder、command buffer、资源状态 tracker 和 lifetime tracker 之间的职责与生命周期。
 
 核心目标：
 
@@ -11,8 +11,8 @@
 - recorder 按输入顺序保存 `Command<'a>`，在 `build()` 时通过全局 tracker 自动插入 barrier，并录制到后端 command buffer。
 - `Recorder::build(self)` 成功后产生 `BuiltRecorder`；queue 通过 `queue.submit(built_recorder)` 提交，成功后 command buffer 进入该 queue 的 pending 列表。
 - queue 定期读取自己的 timeline，把已经完成的 pending command buffer 移回 unused 列表。
-- command buffer 回收不经过全局 discard manager。
-- discard manager 仍是独立的设备级全局管理器，仅负责 GPU 资源的延迟销毁，并使用 mutex 保护。
+- command buffer 回收不进入资源生命周期追踪或 discard manager。
+- RHI 层提供设备级全局 `LifetimeTracker` 和 `DiscardManager`；manager 判断销毁时机，native destroy 仍由 backend 实现。
 
 本文描述行为契约，不固定最终 Rust 类型名和内部数据结构。
 
@@ -20,17 +20,21 @@
 
 ### 2.1 Device / backend
 
+公开 `Backend` wrapper 由全局 singleton 保存；它内部持有 crate-private `Arc<dyn RhiBackend>`。用户只通过 `Backend` 获取资源和同步接口，backend trait 不进入公开 API。
+
 设备拥有：
 
 - 全局 `ResourceTracker`。
-- 全局资源 discard manager。
+- 全局 `LifetimeTracker`。
+- 全局 `DiscardManager`。
 - graphics、transfer 等后端 queue。
 
-`ResourceTracker` 不属于任何一个 queue。queue 可以持有它的共享引用，例如 `Arc<ResourceTracker>`。
+`ResourceTracker` 和 `LifetimeTracker` 都不属于任何一个 queue。queue 分别持有它们的共享引用，例如
+`Arc<ResourceTracker>` 和 `Arc<LifetimeTracker>`。两者不能合并：前者只负责 buffer/image 的 barrier 状态，后者负责所有可能被 GPU command 引用的对象生命周期。
 
-discard manager 与 command buffer 回收是两个独立系统：
+资源延迟销毁与 command buffer 回收是两个独立系统：
 
-- discard manager 延迟销毁 buffer、image、view、sampler 等 GPU 资源。
+- `LifetimeTracker` 判断对象何时不再被 recorder 或 GPU 使用，`DiscardManager` 保存 backend object，backend 销毁自己的 native 对象。
 - queue-local command pool 复用录制与提交所需的 command buffer。
 
 ### 2.2 Queue
@@ -58,7 +62,7 @@ BackendQueue
 
 pool 不是独立 trait，也不进入 `Queue` trait。它只存在于 Vulkan、D3D12、Metal 等具体 queue 实现内部。
 
-queue 是 command buffer 生命周期的唯一 owner。全局 discard manager 不保存 command buffer。
+queue 是 command buffer 生命周期的唯一 owner。discard manager 不保存 command buffer。
 
 ### 2.3 Recorder
 
@@ -73,7 +77,8 @@ Recorder<'queue, 'command>
 BuiltRecorder<'queue>
 ├── originating queue exclusive lease
 ├── command_buffer: Arc<dyn RhiCommandBuffer>
-└── tracker transaction
+├── resource state transaction
+└── lifetime reservation
 ```
 
 recorder 不拥有 tracker，也不拥有 timeline。
@@ -154,7 +159,7 @@ force_flush() -> Result<()>
 4. 让具体后端把 command buffer 准备为可录制状态。
 5. 返回 command buffer，所有权转移给 recorder。
 
-`allocate()` 不访问全局 discard manager。
+`allocate()` 不访问 discard manager。
 
 ### 5.2 非阻塞 flush
 
@@ -264,18 +269,19 @@ build 流程：
 
 1. 后端验证对象归属和 queue capability，不允许 foreign backend 对象或 queue 不支持的命令进入 native recording。
 2. 验证 command stream 的结构，例如 rendering scope 和 debug label 配对。
-3. 请求全局 `ResourceTracker` 分析资源读写、范围和 queue ownership，并创建暂定 transaction。
-4. tracker 按原始命令顺序生成 planned stream：
+3. 请求全局 `LifetimeTracker` 独占预留命令引用的对象。
+4. 请求全局 `ResourceTracker` 分析资源读写、范围和 queue ownership，并创建暂定 transaction。
+5. state tracker 按原始命令顺序生成 planned stream：
    - 自动 memory barrier；
    - 自动 acquire barrier；
    - manual release command 对应的 release barrier；
    - 原始 native commands；
    - 需要等待的其他 queue `SyncPoint`。
-5. 确认 recorder 持有 command buffer `Arc` 的唯一引用，并取得可变 command buffer。
-6. 后端开始录制 command buffer。
-7. 按 planned stream 录制 barrier 和普通 command。
-8. 结束后端录制。
-9. 丢弃 command vector，将 tracker transaction、lease 和 command buffer 移入 `BuiltRecorder`。
+6. 确认 recorder 持有 command buffer `Arc` 的唯一引用，并取得可变 command buffer。
+7. 后端开始录制 command buffer。
+8. 按 planned stream 录制 barrier 和普通 command。
+9. 结束后端录制。
+10. 丢弃 command vector，将两个暂定对象、lease 和 command buffer 移入 `BuiltRecorder`。
 
 build 成功不 commit tracker。只有 native submit 成功后才能 commit。
 
@@ -295,22 +301,52 @@ recording recorder 在 build 前被 drop，或 built recorder 在 submit 前被 
 - built recorder 的 tracker transaction rollback；recording recorder 尚无 transaction；
 - command buffer 返回 originating queue 的 unused；
 - command buffer 不进入 pending；
-- 不访问全局 discard manager。
+- 不访问 discard manager。
 - 释放 queue 独占 lease。
 
 这要求 recorder 持有 queue 独占 lease，保证 recorder 生命周期内 queue 不会先被销毁，并禁止同一 queue 创建第二个 recorder。
 
-## 7. Tracker 事务语义
+## 7. 两类 tracker 的职责
 
-tracker 是 device-global，因为资源可能跨 queue 使用。queue 只持有共享引用。
+两类 tracker 都是 device-global，因为对象可能跨 queue 使用。queue 只持有共享引用。
+
+### 7.1 ResourceTracker
+
+`ResourceTracker` 只追踪影响 barrier 的状态：buffer range 的 access/queue ownership，以及 image subresource 的 access/layout/queue ownership。
+
+Image view 不拥有独立 barrier 状态。涉及 view 的命令会规范化成其底层 image 与 view subresource range，再由 image 状态生成 barrier。
+
+### 7.2 LifetimeTracker
+
+`LifetimeTracker` 独立追踪所有可能被 GPU command 引用的 RHI 对象：buffer、image、image view、sampler、pipeline 和 descriptor set。每个对象使用统一的 `ObjectId`；`ResourceId` 不再存在。
+
+image view 与底层 image 是两个不同对象。具体 view 持有底层 image 的 `Arc`，命令引用 view 时 lifetime reservation 同时包含 view 和 image：销毁 view 不影响 image 的 barrier identity，而 view 存活也保证 image 不会先被释放。
+
+每个 lifetime entry 包含：
+
+```text
+reservation: Option<ReservationId>
+last_uses: Map<TimelineId, SyncPoint>
+retired: bool
+```
+
+`Option<ReservationId>` 表示 build 到 submit/drop 之间的独占预留，不再用计数器表达。`last_uses` 必须按 timeline 保存每条队列的最新值；单个 `SyncPoint` 无法覆盖对象先后被多个 queue 使用的情况。
+
+对象只有同时满足以下条件才能被 backend 销毁：
+
+- 已标记 retired；
+- 不存在正在 build/等待 submit 的 reservation；
+- `last_uses` 中每个 timeline 的值都已完成。
+
+### 7.3 两阶段提交
 
 tracker 必须区分三个时刻：
 
 1. **plan/reserve**：build 时生成 transitions，暂时预留涉及的资源。
-2. **commit**：native submit 成功后，记录资源的新 scheduled state 和本次 `SyncPoint`。
+2. **commit**：native submit 成功后，state transaction 写入新的 scheduled state，lifetime reservation 把本次 `SyncPoint` 写入对应 timeline。
 3. **rollback**：build、submit 失败或未提交 recorder 被 drop 时，释放预留且不改变 committed state。
 
-资源的 committed state 表示已成功安排到 GPU timeline 的状态，不要求 GPU 已经完成。
+资源的 committed state 与对象的 `last_uses` 都表示已成功安排到 GPU timeline，不要求 GPU 已经完成。native submit 失败时，两者都必须 rollback。
 
 跨 queue 使用：
 
@@ -318,11 +354,23 @@ tracker 必须区分三个时刻：
 - target queue 第一次使用该资源时生成 acquire transition。
 - target submit waits 必须包含 source queue 对应的 `SyncPoint`。
 
-## 8. Discard manager
+## 8. Discard manager 与资源 wrapper
 
-discard manager 是 device-global、mutex-protected 的资源延迟销毁管理器。
+`lifetime.rs` 定义 device-global、mutex-protected 的 `DiscardManager`。它保存明确类型的 `DiscardedObject` 枚举：buffer、image、image view、sampler、pipeline 和 descriptor set；不使用泛型 payload。
 
-资源进入 discard manager 时，应保存足以判断安全销毁的信息，例如 tracker 中记录的最后一次 `SyncPoint`。收集时检查对应 timeline 是否完成。
+公开资源是具体 wrapper，例如 `Buffer { inner: Arc<dyn RhiBuffer>, ... }`。`RhiBackend::create_*` 仍只返回 backend object 的 `Arc<dyn Rhi*>`，不会构造或返回具体 wrapper；`Buffer::new`、`Image::new`、`Sampler::new` 和 `ImageView::new` 才是公开构造入口。
+
+`Backend` 是公开句柄。资源的 `create_*` 方法仅供 crate 内部的 wrapper 构造使用；用户通过 `Backend::global()` 获取句柄，再调用 `Backend::queue(QueueKind)` 获取公开的 `Queue` 句柄。`RhiBackend::queue` 和其他 backend trait 接口保持 crate-private。
+
+`RhiBackend::queue` 返回共享的 `Arc<dyn RhiQueue>`，`Queue` wrapper 直接保存该对象。backend 实现同样以 `Arc` 持有其队列。原先分离的 `RhiQueue`/`QueueBackend` 已合并成单个 crate-private trait；公开的 recorder、submit 和 flush 操作只由 `Queue` wrapper 暴露。
+
+wrapper 实现并转发内部 `Rhi*` 接口。wrapper drop 时把唯一持有的 inner `Arc` 移入 discard manager；backend 生命周期由全局 backend 管理，wrapper 本身不保存 backend 引用。`RhiBackend`、`RhiType` 及其他 backend-facing trait 均为 `pub(crate)`，不会成为用户 API。
+
+`terminate()` 是 backend 资源销毁边界：调用方必须先释放所有 concrete wrapper，使其 inner object 进入 singleton discard manager；`terminate()` 在移除 backend 全局引用前清空 discard manager，并通过 backend 的 `destroy_*` 接口销毁所有对象。
+
+inner 使用 `Arc` 而不是 `Box`，因为 image view 等对象需要共享底层资源。flush 除了检查 timeline 和 reservation，还要求 inner `Arc` 只剩 manager 持有；因此 image 会等引用它的 view 先销毁。
+
+flush 取出安全对象后，根据枚举 variant 调用 `RhiBackend::destroy_buffer`、`destroy_image`、`destroy_image_view` 或 `destroy_sampler`。manager 自身不包含 Vulkan、D3D12 或 Metal native destroy 逻辑。
 
 discard manager 不负责：
 
@@ -353,10 +401,13 @@ allocate、build、submit、flush、timeline value 分配与 command buffer 回�
 - pending command buffer 在 timeline 完成前绝不能 reset 或重录。
 - 同一个 queue 同时最多存在一个 recorder。
 - 只有成功的 native submit 才能 commit tracker transaction。
+- lifetime reservation 与 state transaction 必须由同一次 native submit 一起 commit 或一起 rollback。
+- image view 的 lifetime reservation 必须同时包含 view 和底层 image。
+- retired 对象必须等待所有相关 timeline 完成后才能 native destroy。
 - manual release 的 barrier 位置与 command stream 中 release command 的位置一致。
 - 只有 `BuiltRecorder` 能提交，且只能提交到创建它的 queue。
 - queue drop 时不存在 GPU 仍在使用的 command buffer。
-- command buffer 永远不进入全局 discard manager。
+- command buffer 永远不进入 discard manager。
 - `force_flush()` 回收但不销毁 command buffer。
 
 ## 11. 已确认的接口决策

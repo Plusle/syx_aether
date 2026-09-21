@@ -5,10 +5,11 @@ use crate::rhi::{
         record_planned, BufferImageCopy, Command, ImageCopyRegion, IndexType, Rect, RenderingDesc,
         RhiCommandBuffer, Viewport,
     },
-    descriptor::RhiDescriptorSet,
+    descriptor::DescriptorSet,
     error::{RhiError, RhiResult},
-    pipeline::RhiPipeline,
-    resource::{ResourceTracker, RhiBuffer, RhiImage, TrackerTransaction},
+    lifetime::{LifetimeReservation, LifetimeTracker},
+    pipeline::Pipeline,
+    resource::{Buffer, Image, ResourceTracker, TrackerTransaction},
     shader::ShaderStageFlags,
     sync::SyncPoint,
     types::RhiType,
@@ -24,6 +25,51 @@ pub enum QueueKind {
     Transfer,
 }
 
+/// Public handle for a logical backend queue.
+///
+/// Queue operations are implemented through the backend-neutral queue
+/// interface; the concrete backend queue remains private to the crate.
+#[derive(Clone)]
+pub struct Queue {
+    inner: Arc<dyn RhiQueue>,
+}
+
+impl std::fmt::Debug for Queue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Queue")
+            .field("kind", &self.inner.kind())
+            .finish()
+    }
+}
+
+impl Queue {
+    pub(crate) fn new(inner: Arc<dyn RhiQueue>) -> Self {
+        Self { inner }
+    }
+
+    pub fn kind(&self) -> QueueKind {
+        self.inner.kind()
+    }
+
+    pub fn recorder<'queue, 'command>(&'queue self) -> RhiResult<Recorder<'queue, 'command>> {
+        recorder(self.inner.as_ref())
+    }
+
+    pub fn try_recorder<'queue, 'command>(
+        &'queue self,
+    ) -> RhiResult<Option<Recorder<'queue, 'command>>> {
+        try_recorder(self.inner.as_ref())
+    }
+
+    pub fn submit(&self, recorder: BuiltRecorder<'_>) -> RhiResult<SyncPoint> {
+        submit(self.inner.as_ref(), recorder)
+    }
+
+    pub fn force_flush(&self) -> RhiResult<()> {
+        force_flush(self.inner.as_ref())
+    }
+}
+
 /// Process-local identity for one logical queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct QueueId(u64);
@@ -35,36 +81,16 @@ impl QueueId {
     }
 }
 
-mod private {
-    pub trait Sealed {}
-}
-
 /// A backend-neutral GPU queue.
 ///
 /// A recorder holds this queue's exclusive lease from allocation through
 /// build and submit (or drop), so one queue can have at most one live recorder.
-pub trait RhiQueue: RhiType + Sealed {
+pub(crate) trait RhiQueue: RhiType {
     fn kind(&self) -> QueueKind;
-
-    /// Wait for the queue lease and allocate a recorder.
-    fn recorder<'queue, 'command>(&'queue self) -> RhiResult<Recorder<'queue, 'command>>;
-
-    /// Try to allocate a recorder without waiting for the queue lease.
-    fn try_recorder<'queue, 'command>(
-        &'queue self,
-    ) -> RhiResult<Option<Recorder<'queue, 'command>>>;
-
-    /// Submit a built recorder created by this queue.
-    fn submit(&self, recorder: BuiltRecorder<'_>) -> RhiResult<SyncPoint>;
-
-    /// Wait for this queue to become idle and recycle all pending buffers.
-    fn force_flush(&self) -> RhiResult<()>;
-}
-
-pub(crate) trait QueueBackend: RhiType + Sealed {
     fn id(&self) -> QueueId;
     fn gate(&self) -> &Mutex<()>;
     fn tracker(&self) -> &Arc<ResourceTracker>;
+    fn lifetime(&self) -> &Arc<LifetimeTracker>;
     fn resolve_queue(&self, kind: QueueKind) -> RhiResult<QueueId>;
     fn validate_commands(&self, commands: &[Command<'_>]) -> RhiResult<()>;
     fn allocate(&self) -> RhiResult<Arc<dyn RhiCommandBuffer>>;
@@ -78,7 +104,7 @@ pub(crate) trait QueueBackend: RhiType + Sealed {
 }
 
 pub(crate) fn recorder<'queue, 'command>(
-    queue: &'queue dyn QueueBackend,
+    queue: &'queue dyn RhiQueue,
 ) -> RhiResult<Recorder<'queue, 'command>> {
     let lease = queue
         .gate()
@@ -88,7 +114,7 @@ pub(crate) fn recorder<'queue, 'command>(
 }
 
 pub(crate) fn try_recorder<'queue, 'command>(
-    queue: &'queue dyn QueueBackend,
+    queue: &'queue dyn RhiQueue,
 ) -> RhiResult<Option<Recorder<'queue, 'command>>> {
     let lease = match queue.gate().try_lock() {
         Ok(lease) => lease,
@@ -101,7 +127,7 @@ pub(crate) fn try_recorder<'queue, 'command>(
 }
 
 fn allocate_recorder<'queue, 'command>(
-    queue: &'queue dyn QueueBackend,
+    queue: &'queue dyn RhiQueue,
     lease: MutexGuard<'queue, ()>,
 ) -> RhiResult<Recorder<'queue, 'command>> {
     let command_buffer = queue.allocate()?;
@@ -116,7 +142,7 @@ fn allocate_recorder<'queue, 'command>(
 }
 
 pub(crate) fn submit(
-    queue: &dyn QueueBackend,
+    queue: &dyn RhiQueue,
     mut recorder: BuiltRecorder<'_>,
 ) -> RhiResult<SyncPoint> {
     if queue.id() != recorder.queue.id() {
@@ -132,12 +158,17 @@ pub(crate) fn submit(
         .transaction
         .take()
         .expect("built recorder owns a tracker transaction");
+    let lifetime = recorder
+        .lifetime
+        .take()
+        .expect("built recorder owns a lifetime reservation");
     let point = queue.submit_buffer(command_buffer, &transaction.waits)?;
-    transaction.commit(point);
+    transaction.commit();
+    lifetime.commit(point);
     Ok(point)
 }
 
-pub(crate) fn force_flush(queue: &dyn QueueBackend) -> RhiResult<()> {
+pub(crate) fn force_flush(queue: &dyn RhiQueue) -> RhiResult<()> {
     let _lease = queue
         .gate()
         .lock()
@@ -147,7 +178,7 @@ pub(crate) fn force_flush(queue: &dyn QueueBackend) -> RhiResult<()> {
 
 /// Ordered command collection backed by one queue-owned command buffer.
 pub struct Recorder<'queue, 'command> {
-    queue: &'queue dyn QueueBackend,
+    queue: &'queue dyn RhiQueue,
     // Kept for its lifetime; submit deliberately does not lock the queue again.
     lease: Option<MutexGuard<'queue, ()>>,
     command_buffer: Option<Arc<dyn RhiCommandBuffer>>,
@@ -164,11 +195,11 @@ impl std::fmt::Debug for Recorder<'_, '_> {
 }
 
 impl<'queue, 'command> Recorder<'queue, 'command> {
-    pub fn push(&mut self, command: Command<'command>) {
+    pub(crate) fn push(&mut self, command: Command<'command>) {
         self.commands.push(command);
     }
 
-    pub fn extend(&mut self, commands: impl IntoIterator<Item = Command<'command>>) {
+    pub(crate) fn extend(&mut self, commands: impl IntoIterator<Item = Command<'command>>) {
         self.commands.extend(commands);
     }
 
@@ -219,7 +250,7 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn draw_indirect(
         self,
-        buffer: &'command dyn RhiBuffer,
+        buffer: &'command Buffer,
         offset: u64,
         draw_count: u32,
         stride: u32,
@@ -234,7 +265,7 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn draw_indexed_indirect(
         self,
-        buffer: &'command dyn RhiBuffer,
+        buffer: &'command Buffer,
         offset: u64,
         draw_count: u32,
         stride: u32,
@@ -251,15 +282,15 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
         self.command(Command::Dispatch(group_count))
     }
 
-    pub fn dispatch_indirect(self, buffer: &'command dyn RhiBuffer, offset: u64) -> Self {
+    pub fn dispatch_indirect(self, buffer: &'command Buffer, offset: u64) -> Self {
         self.command(Command::DispatchIndirect { buffer, offset })
     }
 
     pub fn copy_buffer(
         self,
-        src: &'command dyn RhiBuffer,
+        src: &'command Buffer,
         src_offset: u64,
-        dst: &'command dyn RhiBuffer,
+        dst: &'command Buffer,
         dst_offset: u64,
         size: u64,
     ) -> Self {
@@ -274,8 +305,8 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn copy_buffer_to_image(
         self,
-        src: &'command dyn RhiBuffer,
-        dst: &'command dyn RhiImage,
+        src: &'command Buffer,
+        dst: &'command Image,
         region: BufferImageCopy,
     ) -> Self {
         self.command(Command::CopyBufferToImage { src, dst, region })
@@ -283,8 +314,8 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn copy_image_to_buffer(
         self,
-        src: &'command dyn RhiImage,
-        dst: &'command dyn RhiBuffer,
+        src: &'command Image,
+        dst: &'command Buffer,
         region: BufferImageCopy,
     ) -> Self {
         self.command(Command::CopyImageToBuffer { src, dst, region })
@@ -292,9 +323,9 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn copy_image(
         self,
-        src: &'command dyn RhiImage,
+        src: &'command Image,
         src_region: ImageCopyRegion,
-        dst: &'command dyn RhiImage,
+        dst: &'command Image,
         dst_region: ImageCopyRegion,
         extent: [u32; 3],
     ) -> Self {
@@ -307,37 +338,29 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
         })
     }
 
-    pub fn release_buffers(
-        self,
-        buffers: &'command [&'command dyn RhiBuffer],
-        target: QueueKind,
-    ) -> Self {
+    pub fn release_buffers(self, buffers: &'command [&'command Buffer], target: QueueKind) -> Self {
         self.command(Command::ReleaseBuffers { buffers, target })
     }
 
-    pub fn release_images(
-        self,
-        images: &'command [&'command dyn RhiImage],
-        target: QueueKind,
-    ) -> Self {
+    pub fn release_images(self, images: &'command [&'command Image], target: QueueKind) -> Self {
         self.command(Command::ReleaseImages { images, target })
     }
 
-    pub fn bind_pipeline(self, pipeline: &'command dyn RhiPipeline) -> Self {
+    pub fn bind_pipeline(self, pipeline: &'command Pipeline) -> Self {
         self.command(Command::BindPipeline(pipeline))
     }
 
     pub fn bind_vertex_buffers(
         self,
         first: u32,
-        buffers: &'command [(&'command dyn RhiBuffer, u64)],
+        buffers: &'command [(&'command Buffer, u64)],
     ) -> Self {
         self.command(Command::BindVertexBuffers { first, buffers })
     }
 
     pub fn bind_index_buffer(
         self,
-        buffer: &'command dyn RhiBuffer,
+        buffer: &'command Buffer,
         offset: u64,
         index_type: IndexType,
     ) -> Self {
@@ -350,9 +373,9 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn bind_descriptor_sets(
         self,
-        pipeline: &'command dyn RhiPipeline,
+        pipeline: &'command Pipeline,
         first_set: u32,
-        sets: &'command [&'command dyn RhiDescriptorSet],
+        sets: &'command [&'command DescriptorSet],
     ) -> Self {
         self.command(Command::BindDescriptorSets {
             pipeline,
@@ -363,7 +386,7 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
 
     pub fn push_constants(
         self,
-        pipeline: &'command dyn RhiPipeline,
+        pipeline: &'command Pipeline,
         stages: ShaderStageFlags,
         offset: u32,
         data: &'command [u8],
@@ -408,10 +431,12 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
     pub fn build(mut self) -> RhiResult<BuiltRecorder<'queue>> {
         self.queue.validate_commands(&self.commands)?;
 
+        let lifetime = self.queue.lifetime().reserve_commands(&self.commands)?;
+
         let (stream, transaction) =
             self.queue
                 .tracker()
-                .plan(self.queue.id(), &self.commands, |kind| {
+                .plan(self.queue.id(), &self.commands, &lifetime, |kind| {
                     self.queue.resolve_queue(kind)
                 })?;
 
@@ -433,6 +458,7 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
             lease: self.lease.take(),
             command_buffer: self.command_buffer.take(),
             transaction: Some(transaction),
+            lifetime: Some(lifetime),
         })
     }
 }
@@ -449,10 +475,11 @@ impl Drop for Recorder<'_, '_> {
 
 /// A successfully recorded command buffer that can be submitted exactly once.
 pub struct BuiltRecorder<'queue> {
-    queue: &'queue dyn QueueBackend,
+    queue: &'queue dyn RhiQueue,
     lease: Option<MutexGuard<'queue, ()>>,
     command_buffer: Option<Arc<dyn RhiCommandBuffer>>,
     transaction: Option<TrackerTransaction>,
+    lifetime: Option<LifetimeReservation>,
 }
 
 impl std::fmt::Debug for BuiltRecorder<'_> {
@@ -466,6 +493,7 @@ impl std::fmt::Debug for BuiltRecorder<'_> {
 impl Drop for BuiltRecorder<'_> {
     fn drop(&mut self) {
         self.transaction.take();
+        self.lifetime.take();
         if let Some(command_buffer) = self.command_buffer.take() {
             self.queue.recycle_unused(command_buffer);
         }
@@ -501,16 +529,13 @@ pub(crate) fn validate_queue_capabilities(
     Ok(())
 }
 
-pub(crate) use private::Sealed;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rhi::{
         command::{BufferImageCopy, ImageCopyRegion, IndexType, Rect, RenderingDesc, Viewport},
-        descriptor::RhiDescriptorSet,
-        pipeline::RhiPipeline,
-        resource::{ResourceId, RhiBuffer, RhiImage},
+        lifetime::{ObjectId, RhiObject},
+        resource::RhiBuffer,
         shader::ShaderStageFlags,
     };
     use std::{
@@ -553,45 +578,27 @@ mod tests {
         fn end_rendering(&mut self) {}
         fn draw(&mut self, _: u32, _: u32, _: u32, _: u32) {}
         fn draw_indexed(&mut self, _: u32, _: u32, _: u32, _: i32, _: u32) {}
-        fn draw_indirect(&mut self, _: &dyn RhiBuffer, _: u64, _: u32, _: u32) {}
-        fn draw_indexed_indirect(&mut self, _: &dyn RhiBuffer, _: u64, _: u32, _: u32) {}
+        fn draw_indirect(&mut self, _: &Buffer, _: u64, _: u32, _: u32) {}
+        fn draw_indexed_indirect(&mut self, _: &Buffer, _: u64, _: u32, _: u32) {}
         fn dispatch(&mut self, _: [u32; 3]) {}
-        fn dispatch_indirect(&mut self, _: &dyn RhiBuffer, _: u64) {}
-        fn copy_buffer(&mut self, _: &dyn RhiBuffer, _: u64, _: &dyn RhiBuffer, _: u64, _: u64) {}
-        fn copy_buffer_to_image(
-            &mut self,
-            _: &dyn RhiBuffer,
-            _: &dyn RhiImage,
-            _: &BufferImageCopy,
-        ) {
-        }
-        fn copy_image_to_buffer(
-            &mut self,
-            _: &dyn RhiImage,
-            _: &dyn RhiBuffer,
-            _: &BufferImageCopy,
-        ) {
-        }
+        fn dispatch_indirect(&mut self, _: &Buffer, _: u64) {}
+        fn copy_buffer(&mut self, _: &Buffer, _: u64, _: &Buffer, _: u64, _: u64) {}
+        fn copy_buffer_to_image(&mut self, _: &Buffer, _: &Image, _: &BufferImageCopy) {}
+        fn copy_image_to_buffer(&mut self, _: &Image, _: &Buffer, _: &BufferImageCopy) {}
         fn copy_image(
             &mut self,
-            _: &dyn RhiImage,
+            _: &Image,
             _: &ImageCopyRegion,
-            _: &dyn RhiImage,
+            _: &Image,
             _: &ImageCopyRegion,
             _: [u32; 3],
         ) {
         }
-        fn bind_pipeline(&mut self, _: &dyn RhiPipeline) {}
-        fn bind_vertex_buffers(&mut self, _: u32, _: &[(&dyn RhiBuffer, u64)]) {}
-        fn bind_index_buffer(&mut self, _: &dyn RhiBuffer, _: u64, _: IndexType) {}
-        fn bind_descriptor_sets(
-            &mut self,
-            _: &dyn RhiPipeline,
-            _: u32,
-            _: &[&dyn RhiDescriptorSet],
-        ) {
-        }
-        fn push_constants(&mut self, _: &dyn RhiPipeline, _: ShaderStageFlags, _: u32, _: &[u8]) {}
+        fn bind_pipeline(&mut self, _: &Pipeline) {}
+        fn bind_vertex_buffers(&mut self, _: u32, _: &[(&Buffer, u64)]) {}
+        fn bind_index_buffer(&mut self, _: &Buffer, _: u64, _: IndexType) {}
+        fn bind_descriptor_sets(&mut self, _: &Pipeline, _: u32, _: &[&DescriptorSet]) {}
+        fn push_constants(&mut self, _: &Pipeline, _: ShaderStageFlags, _: u32, _: &[u8]) {}
         fn set_viewport(&mut self, _: &Viewport) {}
         fn set_scissor(&mut self, _: &Rect) {}
         fn set_blend_constants(&mut self, _: [f32; 4]) {}
@@ -617,6 +624,7 @@ mod tests {
         kind: QueueKind,
         timeline: u64,
         tracker: Arc<ResourceTracker>,
+        lifetime: Arc<LifetimeTracker>,
         lease: Mutex<()>,
         buffers: Mutex<MockBuffers>,
         stats: Arc<BufferStats>,
@@ -634,6 +642,7 @@ mod tests {
                 kind,
                 timeline: id.0,
                 tracker,
+                lifetime: Arc::new(LifetimeTracker::new()),
                 lease: Mutex::new(()),
                 buffers: Mutex::new(MockBuffers::default()),
                 stats: Arc::new(BufferStats::default()),
@@ -662,6 +671,24 @@ mod tests {
             let buffers = self.buffers.lock().unwrap();
             (buffers.unused.len(), buffers.pending.len())
         }
+
+        fn recorder<'queue, 'command>(&'queue self) -> RhiResult<Recorder<'queue, 'command>> {
+            super::recorder(self)
+        }
+
+        fn try_recorder<'queue, 'command>(
+            &'queue self,
+        ) -> RhiResult<Option<Recorder<'queue, 'command>>> {
+            super::try_recorder(self)
+        }
+
+        fn submit(&self, recorder: BuiltRecorder<'_>) -> RhiResult<SyncPoint> {
+            super::submit(self, recorder)
+        }
+
+        fn force_flush(&self) -> RhiResult<()> {
+            super::force_flush(self)
+        }
     }
 
     impl std::fmt::Debug for MockQueue {
@@ -670,9 +697,11 @@ mod tests {
         }
     }
 
-    impl Sealed for MockQueue {}
+    impl RhiQueue for MockQueue {
+        fn kind(&self) -> QueueKind {
+            self.kind
+        }
 
-    impl QueueBackend for MockQueue {
         fn id(&self) -> QueueId {
             self.id
         }
@@ -681,6 +710,9 @@ mod tests {
         }
         fn tracker(&self) -> &Arc<ResourceTracker> {
             &self.tracker
+        }
+        fn lifetime(&self) -> &Arc<LifetimeTracker> {
+            &self.lifetime
         }
         fn resolve_queue(&self, kind: QueueKind) -> RhiResult<QueueId> {
             if kind == self.kind {
@@ -693,7 +725,9 @@ mod tests {
             validate_queue_capabilities(self.kind, commands)?;
             for command in commands {
                 if let Command::CopyBuffer { src, dst, .. } = command {
-                    if !(*src).as_any().is::<TestBuffer>() || !(*dst).as_any().is::<TestBuffer>() {
+                    if !src.inner().as_any().is::<TestBuffer>()
+                        || !dst.inner().as_any().is::<TestBuffer>()
+                    {
                         return Err(RhiError::InvalidCommand(
                             "mock queue received a foreign buffer".into(),
                         ));
@@ -750,43 +784,27 @@ mod tests {
         }
     }
 
-    impl RhiQueue for MockQueue {
-        fn kind(&self) -> QueueKind {
-            self.kind
-        }
-        fn recorder<'queue, 'command>(&'queue self) -> RhiResult<Recorder<'queue, 'command>> {
-            super::recorder(self)
-        }
-        fn try_recorder<'queue, 'command>(
-            &'queue self,
-        ) -> RhiResult<Option<Recorder<'queue, 'command>>> {
-            super::try_recorder(self)
-        }
-        fn submit(&self, recorder: BuiltRecorder<'_>) -> RhiResult<SyncPoint> {
-            super::submit(self, recorder)
-        }
-        fn force_flush(&self) -> RhiResult<()> {
-            super::force_flush(self)
-        }
-    }
-
     #[derive(Debug)]
     struct TestBuffer {
-        id: ResourceId,
+        id: ObjectId,
     }
 
     impl TestBuffer {
-        fn new() -> Self {
-            Self {
-                id: ResourceId::allocate(),
-            }
+        #[allow(clippy::new_ret_no_self)]
+        fn new() -> Buffer {
+            Buffer::from_inner(Arc::new(Self {
+                id: ObjectId::allocate(),
+            }))
+        }
+    }
+
+    impl RhiObject for TestBuffer {
+        fn id(&self) -> ObjectId {
+            self.id
         }
     }
 
     impl RhiBuffer for TestBuffer {
-        fn id(&self) -> ResourceId {
-            self.id
-        }
         fn name(&self) -> &str {
             "test"
         }
@@ -797,27 +815,53 @@ mod tests {
 
     #[derive(Debug)]
     struct ForeignBuffer {
-        id: ResourceId,
+        id: ObjectId,
     }
 
     impl ForeignBuffer {
-        fn new() -> Self {
-            Self {
-                id: ResourceId::allocate(),
-            }
+        #[allow(clippy::new_ret_no_self)]
+        fn new() -> Buffer {
+            Buffer::from_inner(Arc::new(Self {
+                id: ObjectId::allocate(),
+            }))
+        }
+    }
+
+    impl RhiObject for ForeignBuffer {
+        fn id(&self) -> ObjectId {
+            self.id
         }
     }
 
     impl RhiBuffer for ForeignBuffer {
-        fn id(&self) -> ResourceId {
-            self.id
-        }
         fn name(&self) -> &str {
             "foreign"
         }
         fn size(&self) -> u64 {
             64
         }
+    }
+
+    #[test]
+    fn public_queue_wrapper_forwards_recording_and_submission() {
+        let inner = Arc::new(MockQueue::new(
+            QueueKind::Graphics,
+            Arc::new(ResourceTracker::new()),
+        ));
+        let queue = Queue::new(inner.clone());
+
+        assert_eq!(queue.kind(), QueueKind::Graphics);
+        let built = queue
+            .recorder()
+            .unwrap()
+            .begin_debug_label("frame")
+            .end_debug_label()
+            .build()
+            .unwrap();
+        queue.submit(built).unwrap();
+        assert_eq!(inner.counts(), (0, 1));
+        queue.force_flush().unwrap();
+        assert_eq!(inner.counts(), (1, 0));
     }
 
     #[test]
@@ -978,7 +1022,7 @@ mod tests {
         });
         let built = recorder.build().unwrap();
         assert!(queue.submit(built).is_err());
-        assert_eq!(tracker.last_use(destination.id()), None);
+        assert!(queue.lifetime.last_uses(destination.id()).is_empty());
         assert_eq!(queue.counts(), (1, 0));
 
         queue.fail_submit.store(false, Ordering::Relaxed);
@@ -992,7 +1036,7 @@ mod tests {
         });
         let built = recorder.build().unwrap();
         let point = queue.submit(built).unwrap();
-        assert_eq!(tracker.last_use(destination.id()), Some(point));
+        assert_eq!(queue.lifetime.last_uses(destination.id()), vec![point]);
         assert_eq!(queue.counts(), (0, 1));
     }
 

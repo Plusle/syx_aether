@@ -58,7 +58,7 @@ pub struct SamplerDesc;
 /// Every concrete type satisfying these bounds automatically implements this
 /// trait. `as_any` remains object-safe, so it also works through `dyn Rhi*`
 /// trait objects.
-pub trait RhiType: Debug + Any + Send + Sync {
+pub(crate) trait RhiType: Debug + Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 

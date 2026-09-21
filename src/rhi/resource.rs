@@ -1,68 +1,394 @@
 #![allow(dead_code)]
 
 use crate::rhi::{
+    backend::backend,
     command::{Command, ImageSubresourceLayers},
     error::{RhiError, RhiResult},
+    lifetime::{DiscardManager, DiscardedObject, LifetimeReservation, ObjectId, RhiObject},
     queue::{QueueId, QueueKind},
     sync::SyncPoint,
-    types::RhiType,
+    types::{BufferDesc, ImageDesc, ImageViewDesc, SamplerDesc},
 };
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex},
 };
 
-/// Stable identity used by command planning and deferred destruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ResourceId(u64);
-
-impl ResourceId {
-    pub(crate) fn allocate() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// One image aspect selected by an operation or view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ImageAspect {
     Color,
     Depth,
     Stencil,
 }
 
+bitflags::bitflags! {
+    /// Image aspects available on one image resource.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ImageAspectFlags: u8 {
+        const COLOR = 1 << 0;
+        const DEPTH = 1 << 1;
+        const STENCIL = 1 << 2;
+    }
+}
+
+impl From<ImageAspect> for ImageAspectFlags {
+    fn from(aspect: ImageAspect) -> Self {
+        match aspect {
+            ImageAspect::Color => Self::COLOR,
+            ImageAspect::Depth => Self::DEPTH,
+            ImageAspect::Stencil => Self::STENCIL,
+        }
+    }
+}
+
+/// Backend-neutral bounds needed to validate and track image subresources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageSubresourceInfo {
+    pub aspects: ImageAspectFlags,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+}
+
 /// Backend-neutral image subresource range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageSubresourceRange {
-    pub aspect: ImageAspect,
-    pub base_mip: u32,
-    pub mip_count: u32,
-    pub base_layer: u32,
-    pub layer_count: u32,
+    aspect: ImageAspect,
+    base_mip: u32,
+    mip_count: u32,
+    base_layer: u32,
+    layer_count: u32,
 }
 
-pub trait RhiBuffer: RhiType {
-    fn id(&self) -> ResourceId;
+impl ImageSubresourceRange {
+    /// Creates a nonempty range whose end coordinates do not overflow.
+    /// Resource-specific bounds are checked by [`Self::validate`].
+    pub fn new(
+        aspect: ImageAspect,
+        base_mip: u32,
+        mip_count: u32,
+        base_layer: u32,
+        layer_count: u32,
+    ) -> RhiResult<Self> {
+        let range = Self {
+            aspect,
+            base_mip,
+            mip_count,
+            base_layer,
+            layer_count,
+        };
+        range.validate_shape()?;
+        Ok(range)
+    }
+
+    pub const fn aspect(self) -> ImageAspect {
+        self.aspect
+    }
+
+    pub const fn base_mip(self) -> u32 {
+        self.base_mip
+    }
+
+    pub const fn mip_count(self) -> u32 {
+        self.mip_count
+    }
+
+    pub const fn base_layer(self) -> u32 {
+        self.base_layer
+    }
+
+    pub const fn layer_count(self) -> u32 {
+        self.layer_count
+    }
+
+    /// Validates this range against one image's subresource bounds.
+    pub fn validate(self, info: ImageSubresourceInfo) -> RhiResult<()> {
+        self.validated(info).map(|_| ())
+    }
+
+    fn validated(self, info: ImageSubresourceInfo) -> RhiResult<ValidImageRange> {
+        validate_image_info(info)?;
+        self.validate_shape()?;
+        let mip_end = self.base_mip + self.mip_count;
+        let layer_end = self.base_layer + self.layer_count;
+        if !info.aspects.contains(self.aspect.into()) {
+            return Err(RhiError::InvalidCommand(format!(
+                "image does not contain the {:?} aspect",
+                self.aspect
+            )));
+        }
+        if mip_end > info.mip_levels {
+            return Err(RhiError::InvalidCommand(format!(
+                "image mip range [{}, {mip_end}) exceeds {} mip levels",
+                self.base_mip, info.mip_levels
+            )));
+        }
+        if layer_end > info.array_layers {
+            return Err(RhiError::InvalidCommand(format!(
+                "image layer range [{}, {layer_end}) exceeds {} array layers",
+                self.base_layer, info.array_layers
+            )));
+        }
+        Ok(ValidImageRange {
+            aspect: self.aspect,
+            mip_start: self.base_mip,
+            mip_end,
+            layer_start: self.base_layer,
+            layer_end,
+        })
+    }
+
+    fn validate_shape(self) -> RhiResult<()> {
+        if self.mip_count == 0 {
+            return Err(RhiError::InvalidCommand(
+                "image mip count must not be zero".into(),
+            ));
+        }
+        if self.layer_count == 0 {
+            return Err(RhiError::InvalidCommand(
+                "image layer count must not be zero".into(),
+            ));
+        }
+        self.base_mip
+            .checked_add(self.mip_count)
+            .ok_or_else(|| RhiError::InvalidCommand("image mip range overflows u32".into()))?;
+        self.base_layer
+            .checked_add(self.layer_count)
+            .ok_or_else(|| RhiError::InvalidCommand("image layer range overflows u32".into()))?;
+        Ok(())
+    }
+}
+
+fn validate_image_info(info: ImageSubresourceInfo) -> RhiResult<()> {
+    if info.aspects.is_empty() || !ImageAspectFlags::all().contains(info.aspects) {
+        return Err(RhiError::InvalidCommand(
+            "image has an invalid aspect mask".into(),
+        ));
+    }
+    if info.mip_levels == 0 {
+        return Err(RhiError::InvalidCommand(
+            "image must contain at least one mip level".into(),
+        ));
+    }
+    if info.array_layers == 0 {
+        return Err(RhiError::InvalidCommand(
+            "image must contain at least one array layer".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidImageRange {
+    aspect: ImageAspect,
+    mip_start: u32,
+    mip_end: u32,
+    layer_start: u32,
+    layer_end: u32,
+}
+
+pub(crate) trait RhiBuffer: RhiObject {
     fn name(&self) -> &str;
     fn size(&self) -> u64;
 }
 
-pub trait RhiImage: RhiType {
-    fn id(&self) -> ResourceId;
+pub(crate) trait RhiImage: RhiObject {
+    fn subresource_info(&self) -> ImageSubresourceInfo;
 }
 
-pub trait RhiSampler: RhiType {}
+pub(crate) trait RhiSampler: RhiObject {}
 
-pub trait RhiImageView: RhiType {
-    fn image_id(&self) -> ResourceId;
+pub(crate) trait RhiImageView: RhiObject {
+    fn image(&self) -> &dyn RhiImage;
     fn subresource_range(&self) -> ImageSubresourceRange;
+
+    fn image_id(&self) -> ObjectId {
+        self.image().id()
+    }
+
+    fn image_info(&self) -> ImageSubresourceInfo {
+        self.image().subresource_info()
+    }
+}
+
+/// Owning, backend-neutral buffer handle.
+#[derive(Debug)]
+pub struct Buffer {
+    inner: Option<Arc<dyn RhiBuffer>>,
+}
+
+impl Buffer {
+    pub fn new(desc: BufferDesc) -> RhiResult<Self> {
+        backend()?.create_buffer(desc)
+    }
+
+    pub(crate) fn from_inner(inner: Arc<dyn RhiBuffer>) -> Self {
+        Self { inner: Some(inner) }
+    }
+
+    pub(crate) fn inner(&self) -> &dyn RhiBuffer {
+        self.inner
+            .as_deref()
+            .expect("live buffer owns its backend object")
+    }
+}
+
+impl RhiObject for Buffer {
+    fn id(&self) -> ObjectId {
+        self.inner().id()
+    }
+}
+
+impl RhiBuffer for Buffer {
+    fn name(&self) -> &str {
+        self.inner().name()
+    }
+
+    fn size(&self) -> u64 {
+        self.inner().size()
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            DiscardManager::global().retire(DiscardedObject::Buffer(inner));
+        }
+    }
+}
+
+/// Owning, backend-neutral image handle.
+#[derive(Debug)]
+pub struct Image {
+    inner: Option<Arc<dyn RhiImage>>,
+}
+
+impl Image {
+    pub fn new(desc: ImageDesc) -> RhiResult<Self> {
+        backend()?.create_image(desc)
+    }
+
+    pub(crate) fn from_inner(inner: Arc<dyn RhiImage>) -> Self {
+        Self { inner: Some(inner) }
+    }
+
+    pub(crate) fn inner(&self) -> &dyn RhiImage {
+        self.inner
+            .as_deref()
+            .expect("live image owns its backend object")
+    }
+
+    pub(crate) fn inner_arc(&self) -> Arc<dyn RhiImage> {
+        Arc::clone(
+            self.inner
+                .as_ref()
+                .expect("live image owns its backend object"),
+        )
+    }
+}
+
+impl RhiObject for Image {
+    fn id(&self) -> ObjectId {
+        self.inner().id()
+    }
+}
+
+impl RhiImage for Image {
+    fn subresource_info(&self) -> ImageSubresourceInfo {
+        self.inner().subresource_info()
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            DiscardManager::global().retire(DiscardedObject::Image(inner));
+        }
+    }
+}
+
+/// Owning, backend-neutral sampler handle.
+#[derive(Debug)]
+pub struct Sampler {
+    inner: Option<Arc<dyn RhiSampler>>,
+}
+
+impl Sampler {
+    pub fn new(desc: SamplerDesc) -> RhiResult<Self> {
+        backend()?.create_sampler(desc)
+    }
+
+    pub(crate) fn from_inner(inner: Arc<dyn RhiSampler>) -> Self {
+        Self { inner: Some(inner) }
+    }
+
+    fn inner(&self) -> &dyn RhiSampler {
+        self.inner
+            .as_deref()
+            .expect("live sampler owns its backend object")
+    }
+}
+
+impl RhiObject for Sampler {
+    fn id(&self) -> ObjectId {
+        self.inner().id()
+    }
+}
+
+impl RhiSampler for Sampler {}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            DiscardManager::global().retire(DiscardedObject::Sampler(inner));
+        }
+    }
+}
+
+/// Owning, backend-neutral image-view handle.
+#[derive(Debug)]
+pub struct ImageView {
+    inner: Option<Arc<dyn RhiImageView>>,
+}
+
+impl ImageView {
+    pub fn new(image: &Image, desc: ImageViewDesc) -> RhiResult<Self> {
+        backend()?.create_image_view(image, desc)
+    }
+
+    pub(crate) fn from_inner(inner: Arc<dyn RhiImageView>) -> Self {
+        Self { inner: Some(inner) }
+    }
+
+    pub(crate) fn inner(&self) -> &dyn RhiImageView {
+        self.inner
+            .as_deref()
+            .expect("live image view owns its backend object")
+    }
+}
+
+impl RhiObject for ImageView {
+    fn id(&self) -> ObjectId {
+        self.inner().id()
+    }
+}
+
+impl RhiImageView for ImageView {
+    fn image(&self) -> &dyn RhiImage {
+        self.inner().image()
+    }
+
+    fn subresource_range(&self) -> ImageSubresourceRange {
+        self.inner().subresource_range()
+    }
+}
+
+impl Drop for ImageView {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            DiscardManager::global().retire(DiscardedObject::ImageView(inner));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,20 +432,25 @@ pub(crate) struct ResourceState {
 pub(crate) enum ResourceRef<'a> {
     Buffer(&'a dyn RhiBuffer),
     Image(&'a dyn RhiImage),
-    ImageView(&'a dyn RhiImageView),
 }
 
 impl ResourceRef<'_> {
-    pub(crate) fn id(self) -> ResourceId {
+    pub(crate) fn id(self) -> ObjectId {
         match self {
             Self::Buffer(resource) => resource.id(),
             Self::Image(resource) => resource.id(),
-            Self::ImageView(resource) => resource.image_id(),
         }
     }
 
     fn is_image(self) -> bool {
         !matches!(self, Self::Buffer(_))
+    }
+
+    fn image_info(self) -> Option<ImageSubresourceInfo> {
+        match self {
+            Self::Buffer(_) => None,
+            Self::Image(resource) => Some(resource.subresource_info()),
+        }
     }
 }
 
@@ -148,8 +479,14 @@ pub(crate) enum PlannedOp<'a> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceUse<'a> {
     pub(crate) resource: ResourceRef<'a>,
-    pub(crate) range: ResourceRange,
+    range: ValidResourceRange,
     pub(crate) access: Access,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidResourceRange {
+    Buffer { offset: u64, size: u64 },
+    Image(ValidImageRange),
 }
 
 #[derive(Debug)]
@@ -165,25 +502,70 @@ enum AnalyzedOp<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RangeState {
-    range: ResourceRange,
+struct BufferRangeState {
+    offset: u64,
+    size: u64,
     state: Option<ResourceState>,
     released_to: Option<QueueId>,
 }
 
-#[derive(Debug, Default)]
-struct TrackedResource {
-    states: Vec<RangeState>,
-    last_use: Option<SyncPoint>,
-    pending: u32,
-    retired: bool,
+impl BufferRangeState {
+    fn range(self) -> ResourceRange {
+        ResourceRange::Buffer {
+            offset: self.offset,
+            size: self.size,
+        }
+    }
 }
 
-/// Device-global scheduled resource state. GPU-completed state remains the
-/// responsibility of queue timelines and the future discard pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ImageSubresourceKey {
+    aspect: ImageAspect,
+    mip: u32,
+    layer: u32,
+}
+
+impl ImageSubresourceKey {
+    fn range(self) -> ResourceRange {
+        ResourceRange::Image(ImageSubresourceRange {
+            aspect: self.aspect,
+            base_mip: self.mip,
+            mip_count: 1,
+            base_layer: self.layer,
+            layer_count: 1,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageCellState {
+    state: ResourceState,
+    released_to: Option<QueueId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageStates {
+    info: ImageSubresourceInfo,
+    cells: BTreeMap<ImageSubresourceKey, ImageCellState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum TrackedStates {
+    #[default]
+    Uninitialized,
+    Buffer(Vec<BufferRangeState>),
+    Image(ImageStates),
+}
+
+#[derive(Debug, Default)]
+struct TrackedResource {
+    states: TrackedStates,
+}
+
+/// Device-global scheduled buffer/image state used for barrier planning.
 #[derive(Debug, Default)]
 pub struct ResourceTracker {
-    resources: Mutex<HashMap<ResourceId, TrackedResource>>,
+    resources: Mutex<HashMap<ObjectId, TrackedResource>>,
 }
 
 impl ResourceTracker {
@@ -191,39 +573,10 @@ impl ResourceTracker {
         Self::default()
     }
 
-    pub fn last_use(&self, id: ResourceId) -> Option<SyncPoint> {
+    pub(crate) fn forget(&self, id: ObjectId) {
         self.resources
             .lock()
-            .expect("resource tracker poisoned")
-            .get(&id)
-            .and_then(|resource| resource.last_use)
-    }
-
-    pub fn retire(&self, id: ResourceId) {
-        if let Some(resource) = self
-            .resources
-            .lock()
-            .expect("resource tracker poisoned")
-            .get_mut(&id)
-        {
-            resource.retired = true;
-        }
-    }
-
-    pub fn can_destroy(&self, id: ResourceId, completed: impl Fn(SyncPoint) -> bool) -> bool {
-        let resources = self.resources.lock().expect("resource tracker poisoned");
-        let Some(resource) = resources.get(&id) else {
-            return true;
-        };
-        resource.retired
-            && resource.pending == 0
-            && resource.last_use.map(&completed).unwrap_or(true)
-    }
-
-    pub(crate) fn forget(&self, id: ResourceId) {
-        self.resources
-            .lock()
-            .expect("resource tracker poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .remove(&id);
     }
 
@@ -231,6 +584,7 @@ impl ResourceTracker {
         self: &Arc<Self>,
         queue: QueueId,
         commands: &[Command<'a>],
+        lifetime: &LifetimeReservation,
         resolve_queue: impl Fn(QueueKind) -> RhiResult<QueueId>,
     ) -> RhiResult<(Vec<PlannedOp<'a>>, TrackerTransaction)> {
         let analyzed = analyze(commands)?;
@@ -246,27 +600,12 @@ impl ResourceTracker {
                 }
             })
             .collect();
-        let mut resources = self
+        let resources = self
             .resources
             .lock()
             .map_err(|_| RhiError::ResourceState("resource tracker poisoned".into()))?;
 
-        if let Some(id) = touched.iter().find(|id| {
-            resources
-                .get(id)
-                .is_some_and(|resource| resource.pending != 0)
-        }) {
-            return Err(RhiError::ResourceState(format!(
-                "resource {} is already reserved by another pending submission",
-                id.get()
-            )));
-        }
-
-        for id in &touched {
-            resources.entry(*id).or_default().pending += 1;
-        }
-
-        let mut local: HashMap<_, Vec<RangeState>> = touched
+        let mut local: HashMap<_, TrackedStates> = touched
             .iter()
             .map(|id| {
                 (
@@ -278,23 +617,12 @@ impl ResourceTracker {
                 )
             })
             .collect();
-        let last_uses: HashMap<_, _> = touched
-            .iter()
-            .filter_map(|id| {
-                resources
-                    .get(id)
-                    .and_then(|resource| resource.last_use.map(|point| (*id, point)))
-            })
-            .collect();
         drop(resources);
 
-        // From this point on, every early error must release the reservations.
         let mut transaction = TrackerTransaction {
             tracker: Arc::clone(self),
-            touched: touched.into_iter().collect(),
             states: HashMap::new(),
             waits: Vec::new(),
-            committed: false,
         };
 
         let mut waits = HashSet::new();
@@ -315,35 +643,8 @@ impl ResourceTracker {
                     let states = local
                         .get_mut(&resource.id())
                         .expect("release resource must be reserved");
-                    let mut released = false;
-                    for current in states.iter_mut() {
-                        if current.released_to.is_some() {
-                            return Err(RhiError::ResourceState(format!(
-                                "resource {} has already been released",
-                                resource.id().get()
-                            )));
-                        }
-                        let Some(before) = current.state else {
-                            continue;
-                        };
-                        if before.queue != queue {
-                            return Err(RhiError::ResourceState(
-                                "only the owning queue can release a resource".into(),
-                            ));
-                        }
-                        releases.push(Transition {
-                            resource,
-                            range: current.range,
-                            before: Some(before),
-                            after: ResourceState {
-                                access: before.access,
-                                queue: target,
-                            },
-                            kind: TransitionKind::Release,
-                        });
-                        current.released_to = Some(target);
-                        released = true;
-                    }
+                    let released =
+                        release_resource(states, resource, queue, target, &mut releases)?;
                     if !released {
                         return Err(RhiError::ResourceState(format!(
                             "resource {} cannot be released before its first use",
@@ -358,76 +659,8 @@ impl ResourceTracker {
             for usage in uses {
                 let id = usage.resource.id();
                 let states = local.entry(id).or_default();
-                ensure_initial_state(states, usage);
-                let mut did_acquire = false;
-                let after = ResourceState {
-                    access: usage.access,
-                    queue,
-                };
-                let overlapping: Vec<_> = states
-                    .iter()
-                    .filter(|state| overlaps(state.range, usage.range))
-                    .copied()
-                    .collect();
-                for current in overlapping {
-                    if let Some(target) = current.released_to {
-                        if target != queue {
-                            return Err(RhiError::ResourceState(format!(
-                                "resource {} was released to a different queue",
-                                id.get()
-                            )));
-                        }
-                        let before = current.state.expect("released resources have a state");
-                        let acquired_state = ResourceState {
-                            access: before.access,
-                            queue,
-                        };
-                        transitions.push(Transition {
-                            resource: usage.resource,
-                            // Vulkan requires acquire to exactly match the
-                            // range of its paired release. Acquiring any part
-                            // of this state therefore acquires the whole
-                            // released state before applying the narrower use.
-                            range: current.range,
-                            before: Some(before),
-                            after: acquired_state,
-                            kind: TransitionKind::Acquire,
-                        });
-                        replace_state(states, current.range, acquired_state);
-                        did_acquire = true;
-                        if needs_transition(Some(acquired_state), after, usage.resource.is_image())
-                        {
-                            transitions.push(Transition {
-                                resource: usage.resource,
-                                range: intersection(current.range, usage.range),
-                                before: Some(acquired_state),
-                                after,
-                                kind: TransitionKind::Memory,
-                            });
-                        }
-                        continue;
-                    }
-                    if current.state.is_some_and(|before| before.queue != queue) {
-                        return Err(RhiError::ResourceState(format!(
-                            "resource {} crossed queues without an ownership release",
-                            id.get()
-                        )));
-                    }
-                    if needs_transition(current.state, after, usage.resource.is_image()) {
-                        transitions.push(Transition {
-                            resource: usage.resource,
-                            range: intersection(current.range, usage.range),
-                            before: current.state,
-                            after,
-                            kind: TransitionKind::Memory,
-                        });
-                    }
-                }
-                replace_state(states, usage.range, after);
-                if did_acquire {
-                    if let Some(point) = last_uses.get(&id) {
-                        waits.insert(*point);
-                    }
+                if plan_resource_use(states, usage, queue, &mut transitions)? {
+                    waits.extend(lifetime.last_uses(id));
                 }
             }
             if !transitions.is_empty() {
@@ -445,45 +678,328 @@ impl ResourceTracker {
 #[derive(Debug)]
 pub(crate) struct TrackerTransaction {
     tracker: Arc<ResourceTracker>,
-    touched: Vec<ResourceId>,
-    states: HashMap<ResourceId, Vec<RangeState>>,
+    states: HashMap<ObjectId, TrackedStates>,
     pub(crate) waits: Vec<SyncPoint>,
-    committed: bool,
 }
 
 impl TrackerTransaction {
-    pub(crate) fn commit(mut self, point: SyncPoint) {
+    pub(crate) fn commit(mut self) {
         let mut resources = self
             .tracker
             .resources
             .lock()
-            .expect("resource tracker poisoned");
-        for id in &self.touched {
-            let resource = resources.entry(*id).or_default();
-            resource.states = self.states.remove(id).unwrap_or_default();
-            resource.last_use = Some(point);
-            resource.pending -= 1;
+            .unwrap_or_else(|error| error.into_inner());
+        for (id, states) in self.states.drain() {
+            resources.entry(id).or_default().states = states;
         }
-        self.committed = true;
+        drop(resources);
     }
 }
 
-impl Drop for TrackerTransaction {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
+fn release_resource<'a>(
+    states: &mut TrackedStates,
+    resource: ResourceRef<'a>,
+    queue: QueueId,
+    target: QueueId,
+    releases: &mut Vec<Transition<'a>>,
+) -> RhiResult<bool> {
+    let mut released = false;
+    match states {
+        TrackedStates::Uninitialized => {}
+        TrackedStates::Buffer(states) => {
+            if !matches!(resource, ResourceRef::Buffer(_)) {
+                return Err(resource_kind_mismatch(resource.id()));
+            }
+            for current in states {
+                if current.released_to.is_some() {
+                    return Err(already_released(resource.id()));
+                }
+                let Some(before) = current.state else {
+                    continue;
+                };
+                if before.queue != queue {
+                    return Err(not_owned_by_queue(resource.id()));
+                }
+                releases.push(Transition {
+                    resource,
+                    range: current.range(),
+                    before: Some(before),
+                    after: ResourceState {
+                        access: before.access,
+                        queue: target,
+                    },
+                    kind: TransitionKind::Release,
+                });
+                current.released_to = Some(target);
+                released = true;
+            }
         }
-        let mut resources = self
-            .tracker
-            .resources
-            .lock()
-            .expect("resource tracker poisoned");
-        for id in &self.touched {
-            if let Some(resource) = resources.get_mut(id) {
-                resource.pending -= 1;
+        TrackedStates::Image(states) => {
+            if !resource.is_image() {
+                return Err(resource_kind_mismatch(resource.id()));
+            }
+            for (key, current) in &mut states.cells {
+                if current.released_to.is_some() {
+                    return Err(already_released(resource.id()));
+                }
+                if current.state.queue != queue {
+                    return Err(not_owned_by_queue(resource.id()));
+                }
+                releases.push(Transition {
+                    resource,
+                    range: key.range(),
+                    before: Some(current.state),
+                    after: ResourceState {
+                        access: current.state.access,
+                        queue: target,
+                    },
+                    kind: TransitionKind::Release,
+                });
+                current.released_to = Some(target);
+                released = true;
             }
         }
     }
+    Ok(released)
+}
+
+fn plan_resource_use<'a>(
+    states: &mut TrackedStates,
+    usage: ResourceUse<'a>,
+    queue: QueueId,
+    transitions: &mut Vec<Transition<'a>>,
+) -> RhiResult<bool> {
+    match usage.range {
+        ValidResourceRange::Buffer { offset, size } => {
+            let ResourceRef::Buffer(buffer) = usage.resource else {
+                return Err(resource_kind_mismatch(usage.resource.id()));
+            };
+            if matches!(states, TrackedStates::Uninitialized) {
+                *states = TrackedStates::Buffer(vec![BufferRangeState {
+                    offset: 0,
+                    size: buffer.size(),
+                    state: None,
+                    released_to: None,
+                }]);
+            }
+            let TrackedStates::Buffer(states) = states else {
+                return Err(resource_kind_mismatch(usage.resource.id()));
+            };
+            plan_buffer_use(states, usage, offset, size, queue, transitions)
+        }
+        ValidResourceRange::Image(range) => {
+            let info = usage
+                .resource
+                .image_info()
+                .ok_or_else(|| resource_kind_mismatch(usage.resource.id()))?;
+            if matches!(states, TrackedStates::Uninitialized) {
+                *states = TrackedStates::Image(ImageStates {
+                    info,
+                    cells: BTreeMap::new(),
+                });
+            }
+            let TrackedStates::Image(states) = states else {
+                return Err(resource_kind_mismatch(usage.resource.id()));
+            };
+            if states.info != info {
+                return Err(RhiError::ResourceState(format!(
+                    "resource {} was referenced with inconsistent image metadata",
+                    usage.resource.id().get()
+                )));
+            }
+            plan_image_use(states, usage, range, queue, transitions)
+        }
+    }
+}
+
+fn plan_buffer_use<'a>(
+    states: &mut Vec<BufferRangeState>,
+    usage: ResourceUse<'a>,
+    offset: u64,
+    size: u64,
+    queue: QueueId,
+    transitions: &mut Vec<Transition<'a>>,
+) -> RhiResult<bool> {
+    let after = ResourceState {
+        access: usage.access,
+        queue,
+    };
+    let overlapping: Vec<_> = states
+        .iter()
+        .filter(|state| buffer_overlaps(state.offset, state.size, offset, size))
+        .copied()
+        .collect();
+    let mut did_acquire = false;
+    for current in overlapping {
+        if let Some(target) = current.released_to {
+            if target != queue {
+                return Err(released_to_different_queue(usage.resource.id()));
+            }
+            let before = current
+                .state
+                .expect("released buffer ranges always have a state");
+            let acquired = ResourceState {
+                access: before.access,
+                queue,
+            };
+            transitions.push(Transition {
+                resource: usage.resource,
+                range: current.range(),
+                before: Some(before),
+                after: acquired,
+                kind: TransitionKind::Acquire,
+            });
+            replace_buffer_state(states, current.offset, current.size, acquired);
+            did_acquire = true;
+            if needs_transition(Some(acquired), after, false) {
+                let (intersection_offset, intersection_size) =
+                    buffer_intersection(current.offset, current.size, offset, size);
+                transitions.push(Transition {
+                    resource: usage.resource,
+                    range: ResourceRange::Buffer {
+                        offset: intersection_offset,
+                        size: intersection_size,
+                    },
+                    before: Some(acquired),
+                    after,
+                    kind: TransitionKind::Memory,
+                });
+            }
+            continue;
+        }
+        if current.state.is_some_and(|before| before.queue != queue) {
+            return Err(crossed_queues_without_release(usage.resource.id()));
+        }
+        if needs_transition(current.state, after, false) {
+            let (intersection_offset, intersection_size) =
+                buffer_intersection(current.offset, current.size, offset, size);
+            transitions.push(Transition {
+                resource: usage.resource,
+                range: ResourceRange::Buffer {
+                    offset: intersection_offset,
+                    size: intersection_size,
+                },
+                before: current.state,
+                after,
+                kind: TransitionKind::Memory,
+            });
+        }
+    }
+    replace_buffer_state(states, offset, size, after);
+    Ok(did_acquire)
+}
+
+fn plan_image_use<'a>(
+    states: &mut ImageStates,
+    usage: ResourceUse<'a>,
+    range: ValidImageRange,
+    queue: QueueId,
+    transitions: &mut Vec<Transition<'a>>,
+) -> RhiResult<bool> {
+    let after = ResourceState {
+        access: usage.access,
+        queue,
+    };
+    let mut did_acquire = false;
+    for mip in range.mip_start..range.mip_end {
+        for layer in range.layer_start..range.layer_end {
+            let key = ImageSubresourceKey {
+                aspect: range.aspect,
+                mip,
+                layer,
+            };
+            let current = states.cells.get(&key).copied();
+            if let Some(current) = current {
+                if let Some(target) = current.released_to {
+                    if target != queue {
+                        return Err(released_to_different_queue(usage.resource.id()));
+                    }
+                    let acquired = ResourceState {
+                        access: current.state.access,
+                        queue,
+                    };
+                    transitions.push(Transition {
+                        resource: usage.resource,
+                        range: key.range(),
+                        before: Some(current.state),
+                        after: acquired,
+                        kind: TransitionKind::Acquire,
+                    });
+                    did_acquire = true;
+                    if needs_transition(Some(acquired), after, true) {
+                        transitions.push(Transition {
+                            resource: usage.resource,
+                            range: key.range(),
+                            before: Some(acquired),
+                            after,
+                            kind: TransitionKind::Memory,
+                        });
+                    }
+                    states.cells.insert(
+                        key,
+                        ImageCellState {
+                            state: after,
+                            released_to: None,
+                        },
+                    );
+                    continue;
+                }
+                if current.state.queue != queue {
+                    return Err(crossed_queues_without_release(usage.resource.id()));
+                }
+            }
+            let before = current.map(|current| current.state);
+            if needs_transition(before, after, true) {
+                transitions.push(Transition {
+                    resource: usage.resource,
+                    range: key.range(),
+                    before,
+                    after,
+                    kind: TransitionKind::Memory,
+                });
+            }
+            states.cells.insert(
+                key,
+                ImageCellState {
+                    state: after,
+                    released_to: None,
+                },
+            );
+        }
+    }
+    Ok(did_acquire)
+}
+
+fn resource_kind_mismatch(id: ObjectId) -> RhiError {
+    RhiError::ResourceState(format!(
+        "resource {} was used as both a buffer and an image",
+        id.get()
+    ))
+}
+
+fn already_released(id: ObjectId) -> RhiError {
+    RhiError::ResourceState(format!("resource {} has already been released", id.get()))
+}
+
+fn not_owned_by_queue(id: ObjectId) -> RhiError {
+    RhiError::ResourceState(format!(
+        "queue does not own resource {} and cannot release it",
+        id.get()
+    ))
+}
+
+fn released_to_different_queue(id: ObjectId) -> RhiError {
+    RhiError::ResourceState(format!(
+        "resource {} was released to a different queue",
+        id.get()
+    ))
+}
+
+fn crossed_queues_without_release(id: ObjectId) -> RhiError {
+    RhiError::ResourceState(format!(
+        "resource {} crossed queues without an ownership release",
+        id.get()
+    ))
 }
 
 fn analyze<'a>(commands: &[Command<'a>]) -> RhiResult<Vec<AnalyzedOp<'a>>> {
@@ -540,31 +1056,21 @@ fn analyze<'a>(commands: &[Command<'a>]) -> RhiResult<Vec<AnalyzedOp<'a>>> {
                 rendering = true;
                 let mut uses = Vec::new();
                 for attachment in desc.color_attachments {
-                    uses.push(ResourceUse {
-                        resource: ResourceRef::ImageView(attachment.view),
-                        range: ResourceRange::Image(attachment.view.subresource_range()),
-                        access: Access::ColorAttachmentReadWrite,
-                    });
+                    uses.push(image_view_use(
+                        attachment.view,
+                        Access::ColorAttachmentReadWrite,
+                    )?);
                     if let Some(resolve) = attachment.resolve {
-                        uses.push(ResourceUse {
-                            resource: ResourceRef::ImageView(resolve),
-                            range: ResourceRange::Image(resolve.subresource_range()),
-                            access: Access::ColorAttachmentReadWrite,
-                        });
+                        uses.push(image_view_use(resolve, Access::ColorAttachmentReadWrite)?);
                     }
                 }
                 if let Some(attachment) = desc.depth_stencil {
-                    uses.push(ResourceUse {
-                        resource: ResourceRef::ImageView(attachment.view),
-                        range: ResourceRange::Image(attachment.view.subresource_range()),
-                        access: Access::DepthStencilReadWrite,
-                    });
+                    uses.push(image_view_use(
+                        attachment.view,
+                        Access::DepthStencilReadWrite,
+                    )?);
                     if let Some(resolve) = attachment.resolve {
-                        uses.push(ResourceUse {
-                            resource: ResourceRef::ImageView(resolve),
-                            range: ResourceRange::Image(resolve.subresource_range()),
-                            access: Access::DepthStencilReadWrite,
-                        });
+                        uses.push(image_view_use(resolve, Access::DepthStencilReadWrite)?);
                     }
                 }
                 uses
@@ -622,14 +1128,14 @@ fn analyze<'a>(commands: &[Command<'a>]) -> RhiResult<Vec<AnalyzedOp<'a>>> {
                     ResourceRef::Image(dst),
                     region.image_subresource,
                     Access::TransferWrite,
-                ),
+                )?,
             ],
             Command::CopyImageToBuffer { src, dst, region } => vec![
                 image_use(
                     ResourceRef::Image(src),
                     region.image_subresource,
                     Access::TransferRead,
-                ),
+                )?,
                 buffer_use(
                     dst,
                     region.buffer_offset,
@@ -648,12 +1154,12 @@ fn analyze<'a>(commands: &[Command<'a>]) -> RhiResult<Vec<AnalyzedOp<'a>>> {
                     ResourceRef::Image(src),
                     src_region.subresource,
                     Access::TransferRead,
-                ),
+                )?,
                 image_use(
                     ResourceRef::Image(dst),
                     dst_region.subresource,
                     Access::TransferWrite,
-                ),
+                )?,
             ],
             Command::BindVertexBuffers { buffers, .. } => buffers
                 .iter()
@@ -726,7 +1232,7 @@ fn buffer_use<'a>(
     }
     Ok(ResourceUse {
         resource: ResourceRef::Buffer(buffer),
-        range: ResourceRange::Buffer { offset, size },
+        range: ValidResourceRange::Buffer { offset, size },
         access,
     })
 }
@@ -735,36 +1241,32 @@ fn image_use(
     resource: ResourceRef<'_>,
     layers: ImageSubresourceLayers,
     access: Access,
-) -> ResourceUse<'_> {
-    ResourceUse {
-        resource,
-        range: ResourceRange::Image(ImageSubresourceRange {
-            aspect: layers.aspect,
-            base_mip: layers.mip,
-            mip_count: 1,
-            base_layer: layers.base_layer,
-            layer_count: layers.layer_count,
-        }),
-        access,
+) -> RhiResult<ResourceUse<'_>> {
+    let info = resource
+        .image_info()
+        .ok_or_else(|| resource_kind_mismatch(resource.id()))?;
+    let range = ImageSubresourceRange {
+        aspect: layers.aspect,
+        base_mip: layers.mip,
+        mip_count: 1,
+        base_layer: layers.base_layer,
+        layer_count: layers.layer_count,
     }
+    .validated(info)?;
+    Ok(ResourceUse {
+        resource,
+        range: ValidResourceRange::Image(range),
+        access,
+    })
 }
 
-fn ensure_initial_state(states: &mut Vec<RangeState>, usage: ResourceUse<'_>) {
-    if !states.is_empty() {
-        return;
-    }
-    let range = match usage.resource {
-        ResourceRef::Buffer(buffer) => ResourceRange::Buffer {
-            offset: 0,
-            size: buffer.size(),
-        },
-        ResourceRef::Image(_) | ResourceRef::ImageView(_) => usage.range,
-    };
-    states.push(RangeState {
-        range,
-        state: None,
-        released_to: None,
-    });
+fn image_view_use(view: &dyn RhiImageView, access: Access) -> RhiResult<ResourceUse<'_>> {
+    let range = view.subresource_range().validated(view.image_info())?;
+    Ok(ResourceUse {
+        resource: ResourceRef::Image(view.image()),
+        range: ValidResourceRange::Image(range),
+        access,
+    })
 }
 
 fn needs_transition(before: Option<ResourceState>, after: ResourceState, image: bool) -> bool {
@@ -777,172 +1279,86 @@ fn needs_transition(before: Option<ResourceState>, after: ResourceState, image: 
         || after.access.is_write()
 }
 
-fn overlaps(a: ResourceRange, b: ResourceRange) -> bool {
-    match (a, b) {
-        (
-            ResourceRange::Buffer {
-                offset: a,
-                size: a_size,
-            },
-            ResourceRange::Buffer {
-                offset: b,
-                size: b_size,
-            },
-        ) => a < b.saturating_add(b_size) && b < a.saturating_add(a_size),
-        (ResourceRange::Image(a), ResourceRange::Image(b)) => {
-            a.aspect == b.aspect
-                && a.base_mip < b.base_mip.saturating_add(b.mip_count)
-                && b.base_mip < a.base_mip.saturating_add(a.mip_count)
-                && a.base_layer < b.base_layer.saturating_add(b.layer_count)
-                && b.base_layer < a.base_layer.saturating_add(a.layer_count)
-        }
-        _ => false,
-    }
+fn buffer_overlaps(a: u64, a_size: u64, b: u64, b_size: u64) -> bool {
+    a < b + b_size && b < a + a_size
 }
 
-fn intersection(a: ResourceRange, b: ResourceRange) -> ResourceRange {
-    match (a, b) {
-        (
-            ResourceRange::Buffer {
-                offset: a,
-                size: a_size,
-            },
-            ResourceRange::Buffer {
-                offset: b,
-                size: b_size,
-            },
-        ) => {
-            let start = a.max(b);
-            let end = a.saturating_add(a_size).min(b.saturating_add(b_size));
-            ResourceRange::Buffer {
-                offset: start,
-                size: end - start,
-            }
-        }
-        (ResourceRange::Image(a), ResourceRange::Image(b)) => {
-            let mip = a.base_mip.max(b.base_mip);
-            let mip_end = a
-                .base_mip
-                .saturating_add(a.mip_count)
-                .min(b.base_mip.saturating_add(b.mip_count));
-            let layer = a.base_layer.max(b.base_layer);
-            let layer_end = a
-                .base_layer
-                .saturating_add(a.layer_count)
-                .min(b.base_layer.saturating_add(b.layer_count));
-            ResourceRange::Image(ImageSubresourceRange {
-                aspect: a.aspect,
-                base_mip: mip,
-                mip_count: mip_end - mip,
-                base_layer: layer,
-                layer_count: layer_end - layer,
-            })
-        }
-        _ => unreachable!("resource range kinds must match"),
-    }
+fn buffer_intersection(a: u64, a_size: u64, b: u64, b_size: u64) -> (u64, u64) {
+    let start = a.max(b);
+    let end = (a + a_size).min(b + b_size);
+    (start, end - start)
 }
 
-fn replace_state(states: &mut Vec<RangeState>, range: ResourceRange, state: ResourceState) {
-    match range {
-        ResourceRange::Buffer { offset, size } => {
-            let end = offset + size;
-            let mut next = Vec::new();
-            for old in states.drain(..) {
-                let ResourceRange::Buffer {
-                    offset: old_offset,
-                    size: old_size,
-                } = old.range
-                else {
-                    next.push(old);
-                    continue;
-                };
-                let old_end = old_offset + old_size;
-                if old_end <= offset || end <= old_offset {
-                    next.push(old);
-                    continue;
-                }
-                if old_offset < offset {
-                    next.push(RangeState {
-                        range: ResourceRange::Buffer {
-                            offset: old_offset,
-                            size: offset - old_offset,
-                        },
-                        state: old.state,
-                        released_to: old.released_to,
-                    });
-                }
-                if end < old_end {
-                    next.push(RangeState {
-                        range: ResourceRange::Buffer {
-                            offset: end,
-                            size: old_end - end,
-                        },
-                        state: old.state,
-                        released_to: old.released_to,
-                    });
-                }
-            }
-            next.push(RangeState {
-                range,
-                state: Some(state),
-                released_to: None,
-            });
-            next.sort_by_key(|entry| match entry.range {
-                ResourceRange::Buffer { offset, .. } => offset,
-                ResourceRange::Image(_) => u64::MAX,
-            });
-            *states = next;
+fn replace_buffer_state(
+    states: &mut Vec<BufferRangeState>,
+    offset: u64,
+    size: u64,
+    state: ResourceState,
+) {
+    let end = offset + size;
+    let mut next = Vec::new();
+    for old in states.drain(..) {
+        let old_end = old.offset + old.size;
+        if old_end <= offset || end <= old.offset {
+            next.push(old);
+            continue;
         }
-        ResourceRange::Image(range) => {
-            let mut next = Vec::new();
-            for mip in range.base_mip..range.base_mip + range.mip_count {
-                for layer in range.base_layer..range.base_layer + range.layer_count {
-                    let cell = ResourceRange::Image(ImageSubresourceRange {
-                        aspect: range.aspect,
-                        base_mip: mip,
-                        mip_count: 1,
-                        base_layer: layer,
-                        layer_count: 1,
-                    });
-                    states.retain(|old| !overlaps(old.range, cell));
-                    next.push(RangeState {
-                        range: cell,
-                        state: Some(state),
-                        released_to: None,
-                    });
-                }
-            }
-            states.extend(next);
+        if old.offset < offset {
+            next.push(BufferRangeState {
+                offset: old.offset,
+                size: offset - old.offset,
+                state: old.state,
+                released_to: old.released_to,
+            });
+        }
+        if end < old_end {
+            next.push(BufferRangeState {
+                offset: end,
+                size: old_end - end,
+                state: old.state,
+                released_to: old.released_to,
+            });
         }
     }
+    next.push(BufferRangeState {
+        offset,
+        size,
+        state: Some(state),
+        released_to: None,
+    });
+    next.sort_by_key(|entry| entry.offset);
+    *states = next;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rhi::command::ImageCopyRegion;
+    use crate::rhi::{command::ImageCopyRegion, lifetime::LifetimeTracker};
     use std::sync::OnceLock;
 
     #[derive(Debug)]
     struct TestBuffer {
-        id: ResourceId,
+        id: ObjectId,
         size: u64,
     }
 
     impl TestBuffer {
-        fn new(size: u64) -> Self {
-            Self {
-                id: ResourceId::allocate(),
+        #[allow(clippy::new_ret_no_self)]
+        fn new(size: u64) -> Buffer {
+            Buffer::from_inner(Arc::new(Self {
+                id: ObjectId::allocate(),
                 size,
-            }
+            }))
+        }
+    }
+
+    impl RhiObject for TestBuffer {
+        fn id(&self) -> ObjectId {
+            self.id
         }
     }
 
     impl RhiBuffer for TestBuffer {
-        fn id(&self) -> ResourceId {
-            self.id
-        }
-
         fn name(&self) -> &str {
             "test"
         }
@@ -954,21 +1370,146 @@ mod tests {
 
     #[derive(Debug)]
     struct TestImage {
-        id: ResourceId,
+        id: ObjectId,
+        info: ImageSubresourceInfo,
     }
 
     impl TestImage {
-        fn new() -> Self {
-            Self {
-                id: ResourceId::allocate(),
-            }
+        #[allow(clippy::new_ret_no_self)]
+        fn new() -> Image {
+            Image::from_inner(Arc::new(Self {
+                id: ObjectId::allocate(),
+                info: ImageSubresourceInfo {
+                    aspects: ImageAspectFlags::COLOR,
+                    mip_levels: 4,
+                    array_layers: 4,
+                },
+            }))
+        }
+    }
+
+    impl RhiObject for TestImage {
+        fn id(&self) -> ObjectId {
+            self.id
         }
     }
 
     impl RhiImage for TestImage {
-        fn id(&self) -> ResourceId {
-            self.id
+        fn subresource_info(&self) -> ImageSubresourceInfo {
+            self.info
         }
+    }
+
+    #[test]
+    fn image_subresource_range_rejects_invalid_bounds() {
+        let info = ImageSubresourceInfo {
+            aspects: ImageAspectFlags::COLOR,
+            mip_levels: 4,
+            array_layers: 2,
+        };
+        for range in [
+            ImageSubresourceRange {
+                aspect: ImageAspect::Color,
+                base_mip: 0,
+                mip_count: 0,
+                base_layer: 0,
+                layer_count: 1,
+            },
+            ImageSubresourceRange {
+                aspect: ImageAspect::Color,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 0,
+                layer_count: 0,
+            },
+            ImageSubresourceRange {
+                aspect: ImageAspect::Color,
+                base_mip: u32::MAX,
+                mip_count: 2,
+                base_layer: 0,
+                layer_count: 1,
+            },
+            ImageSubresourceRange {
+                aspect: ImageAspect::Color,
+                base_mip: 3,
+                mip_count: 2,
+                base_layer: 0,
+                layer_count: 1,
+            },
+            ImageSubresourceRange {
+                aspect: ImageAspect::Color,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 1,
+                layer_count: 2,
+            },
+            ImageSubresourceRange {
+                aspect: ImageAspect::Depth,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 0,
+                layer_count: 1,
+            },
+        ] {
+            assert!(matches!(
+                range.validate(info),
+                Err(RhiError::InvalidCommand(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn disjoint_image_mips_each_get_an_initial_transition() {
+        let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
+        let source = TestImage::new();
+        let destination = TestImage::new();
+        let copy = |mip| Command::CopyImage {
+            src: &source,
+            src_region: ImageCopyRegion {
+                subresource: ImageSubresourceLayers {
+                    aspect: ImageAspect::Color,
+                    mip,
+                    base_layer: 0,
+                    layer_count: 1,
+                },
+                offset: [0; 3],
+            },
+            dst: &destination,
+            dst_region: ImageCopyRegion {
+                subresource: ImageSubresourceLayers {
+                    aspect: ImageAspect::Color,
+                    mip,
+                    base_layer: 0,
+                    layer_count: 1,
+                },
+                offset: [0; 3],
+            },
+            extent: [1; 3],
+        };
+        let commands = [copy(0), copy(1)];
+
+        let (planned, _transaction, _reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &commands).unwrap();
+        let has_initial_transition = |mip| {
+            planned.iter().any(|operation| match operation {
+                PlannedOp::Barriers(transitions) => transitions.iter().any(|transition| {
+                    transition.resource.id() == destination.id()
+                        && transition.before.is_none()
+                        && transition.range
+                            == ResourceRange::Image(ImageSubresourceRange {
+                                aspect: ImageAspect::Color,
+                                base_mip: mip,
+                                mip_count: 1,
+                                base_layer: 0,
+                                layer_count: 1,
+                            })
+                }),
+                PlannedOp::Command(_) => false,
+            })
+        };
+        assert!(has_initial_transition(0));
+        assert!(has_initial_transition(1));
     }
 
     fn graphics_queue() -> QueueId {
@@ -988,9 +1529,21 @@ mod tests {
         }
     }
 
+    fn plan<'a>(
+        tracker: &Arc<ResourceTracker>,
+        lifetime: &Arc<LifetimeTracker>,
+        queue: QueueId,
+        commands: &[Command<'a>],
+    ) -> RhiResult<(Vec<PlannedOp<'a>>, TrackerTransaction, LifetimeReservation)> {
+        let reservation = lifetime.reserve_commands(commands)?;
+        let (planned, transaction) = tracker.plan(queue, commands, &reservation, resolve_queue)?;
+        Ok((planned, transaction, reservation))
+    }
+
     #[test]
     fn planner_preserves_commands_and_inserts_write_dependencies() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let a = TestBuffer::new(64);
         let b = TestBuffer::new(64);
         let commands = [
@@ -1010,9 +1563,8 @@ mod tests {
             },
         ];
 
-        let (planned, _transaction) = tracker
-            .plan(graphics_queue(), &commands, resolve_queue)
-            .unwrap();
+        let (planned, _transaction, _reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &commands).unwrap();
         assert!(matches!(
             planned[0],
             PlannedOp::Command(Command::CopyBuffer { .. })
@@ -1030,20 +1582,16 @@ mod tests {
     #[test]
     fn disjoint_buffer_ranges_keep_independent_state() {
         let queue = graphics_queue();
-        let mut states = vec![RangeState {
-            range: ResourceRange::Buffer {
-                offset: 0,
-                size: 64,
-            },
+        let mut states = vec![BufferRangeState {
+            offset: 0,
+            size: 64,
             state: None,
             released_to: None,
         }];
-        replace_state(
+        replace_buffer_state(
             &mut states,
-            ResourceRange::Buffer {
-                offset: 0,
-                size: 16,
-            },
+            0,
+            16,
             ResourceState {
                 access: Access::TransferWrite,
                 queue,
@@ -1053,13 +1601,7 @@ mod tests {
         assert_eq!(
             states
                 .iter()
-                .find(|entry| {
-                    entry.range
-                        == ResourceRange::Buffer {
-                            offset: 16,
-                            size: 48,
-                        }
-                })
+                .find(|entry| entry.offset == 16 && entry.size == 48)
                 .unwrap()
                 .state,
             None
@@ -1069,6 +1611,7 @@ mod tests {
     #[test]
     fn tracker_only_commits_after_successful_submit_point() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let a = TestBuffer::new(16);
         let b = TestBuffer::new(16);
         let commands = [Command::CopyBuffer {
@@ -1079,25 +1622,26 @@ mod tests {
             size: 16,
         }];
 
-        let (_, transaction) = tracker
-            .plan(graphics_queue(), &commands, resolve_queue)
-            .unwrap();
-        assert_eq!(tracker.last_use(a.id()), None);
+        let (_, transaction, reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &commands).unwrap();
+        assert!(lifetime.last_uses(a.id()).is_empty());
         drop(transaction);
-        assert_eq!(tracker.last_use(a.id()), None);
+        drop(reservation);
+        assert!(lifetime.last_uses(a.id()).is_empty());
 
-        let (_, transaction) = tracker
-            .plan(graphics_queue(), &commands, resolve_queue)
-            .unwrap();
+        let (_, transaction, reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &commands).unwrap();
         let point = SyncPoint::new(7, 3);
-        transaction.commit(point);
-        assert_eq!(tracker.last_use(a.id()), Some(point));
-        assert_eq!(tracker.last_use(b.id()), Some(point));
+        transaction.commit();
+        reservation.commit(point);
+        assert_eq!(lifetime.last_uses(a.id()), vec![point]);
+        assert_eq!(lifetime.last_uses(b.id()), vec![point]);
     }
 
     #[test]
     fn pending_submission_reserves_resources() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let a = TestBuffer::new(16);
         let b = TestBuffer::new(16);
         let commands = [Command::CopyBuffer {
@@ -1107,24 +1651,21 @@ mod tests {
             dst_offset: 0,
             size: 16,
         }];
-        let (_, transaction) = tracker
-            .plan(graphics_queue(), &commands, resolve_queue)
-            .unwrap();
-        assert!(tracker
-            .plan(graphics_queue(), &commands, resolve_queue)
-            .is_err());
+        let (_, transaction, reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &commands).unwrap();
+        assert!(plan(&tracker, &lifetime, graphics_queue(), &commands).is_err());
         drop(transaction);
-        assert!(tracker
-            .plan(graphics_queue(), &commands, resolve_queue)
-            .is_ok());
+        drop(reservation);
+        assert!(plan(&tracker, &lifetime, graphics_queue(), &commands).is_ok());
     }
 
     #[test]
     fn invalid_command_structure_is_rejected() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let commands = [Command::EndRendering];
         assert!(matches!(
-            tracker.plan(graphics_queue(), &commands, resolve_queue),
+            plan(&tracker, &lifetime, graphics_queue(), &commands),
             Err(RhiError::InvalidCommand(_))
         ));
     }
@@ -1132,10 +1673,11 @@ mod tests {
     #[test]
     fn transfer_release_becomes_graphics_wait_and_acquire() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let staging = TestBuffer::new(16);
         let uploaded = TestBuffer::new(16);
         let output = TestBuffer::new(16);
-        let released: [&dyn RhiBuffer; 1] = [&uploaded];
+        let released = [&uploaded];
         let transfer_commands = [
             Command::CopyBuffer {
                 src: &staging,
@@ -1149,11 +1691,11 @@ mod tests {
                 target: QueueKind::Graphics,
             },
         ];
-        let (_, transfer_transaction) = tracker
-            .plan(transfer_queue(), &transfer_commands, resolve_queue)
-            .unwrap();
+        let (_, transfer_transaction, transfer_reservation) =
+            plan(&tracker, &lifetime, transfer_queue(), &transfer_commands).unwrap();
         let transfer_point = SyncPoint::new(11, 4);
-        transfer_transaction.commit(transfer_point);
+        transfer_transaction.commit();
+        transfer_reservation.commit(transfer_point);
 
         let graphics_commands = [Command::CopyBuffer {
             src: &uploaded,
@@ -1162,9 +1704,8 @@ mod tests {
             dst_offset: 0,
             size: 16,
         }];
-        let (planned, graphics_transaction) = tracker
-            .plan(graphics_queue(), &graphics_commands, resolve_queue)
-            .unwrap();
+        let (planned, graphics_transaction, _graphics_reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &graphics_commands).unwrap();
         assert_eq!(graphics_transaction.waits, vec![transfer_point]);
         let PlannedOp::Barriers(transitions) = &planned[0] else {
             panic!("graphics use must acquire transfer ownership");
@@ -1178,10 +1719,11 @@ mod tests {
     #[test]
     fn partial_use_acquires_the_complete_released_buffer_range() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let staging = TestBuffer::new(64);
         let uploaded = TestBuffer::new(64);
         let output = TestBuffer::new(16);
-        let released: [&dyn RhiBuffer; 1] = [&uploaded];
+        let released = [&uploaded];
         let transfer_commands = [
             Command::CopyBuffer {
                 src: &staging,
@@ -1195,9 +1737,8 @@ mod tests {
                 target: QueueKind::Graphics,
             },
         ];
-        let (transfer_plan, transfer_transaction) = tracker
-            .plan(transfer_queue(), &transfer_commands, resolve_queue)
-            .unwrap();
+        let (transfer_plan, transfer_transaction, transfer_reservation) =
+            plan(&tracker, &lifetime, transfer_queue(), &transfer_commands).unwrap();
         let release = transfer_plan
             .iter()
             .filter_map(|operation| match operation {
@@ -1219,7 +1760,9 @@ mod tests {
                 size: 64
             }
         );
-        transfer_transaction.commit(SyncPoint::new(17, 3));
+        let transfer_point = SyncPoint::new(17, 3);
+        transfer_transaction.commit();
+        transfer_reservation.commit(transfer_point);
 
         let graphics_commands = [Command::CopyBuffer {
             src: &uploaded,
@@ -1228,9 +1771,8 @@ mod tests {
             dst_offset: 0,
             size: 16,
         }];
-        let (graphics_plan, _graphics_transaction) = tracker
-            .plan(graphics_queue(), &graphics_commands, resolve_queue)
-            .unwrap();
+        let (graphics_plan, _graphics_transaction, _graphics_reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &graphics_commands).unwrap();
         let transitions: Vec<_> = graphics_plan
             .iter()
             .filter_map(|operation| match operation {
@@ -1261,10 +1803,11 @@ mod tests {
     #[test]
     fn image_acquire_matches_its_released_subresource_state() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let source = TestImage::new();
         let uploaded = TestImage::new();
         let output = TestImage::new();
-        let released: [&dyn RhiImage; 1] = [&uploaded];
+        let released = [&uploaded];
         let two_layers = ImageSubresourceLayers {
             aspect: ImageAspect::Color,
             mip: 0,
@@ -1290,10 +1833,11 @@ mod tests {
                 target: QueueKind::Graphics,
             },
         ];
-        let (transfer_plan, transfer_transaction) = tracker
-            .plan(transfer_queue(), &transfer_commands, resolve_queue)
-            .unwrap();
-        transfer_transaction.commit(SyncPoint::new(19, 2));
+        let (transfer_plan, transfer_transaction, transfer_reservation) =
+            plan(&tracker, &lifetime, transfer_queue(), &transfer_commands).unwrap();
+        let transfer_point = SyncPoint::new(19, 2);
+        transfer_transaction.commit();
+        transfer_reservation.commit(transfer_point);
 
         let one_layer = ImageSubresourceLayers {
             layer_count: 1,
@@ -1312,9 +1856,8 @@ mod tests {
             },
             extent: [1; 3],
         }];
-        let (graphics_plan, _graphics_transaction) = tracker
-            .plan(graphics_queue(), &graphics_commands, resolve_queue)
-            .unwrap();
+        let (graphics_plan, _graphics_transaction, _graphics_reservation) =
+            plan(&tracker, &lifetime, graphics_queue(), &graphics_commands).unwrap();
         let acquire = graphics_plan
             .iter()
             .filter_map(|operation| match operation {
@@ -1343,10 +1886,11 @@ mod tests {
     #[test]
     fn release_command_keeps_position_and_batches_resources() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let staging = TestBuffer::new(32);
         let first = TestBuffer::new(16);
         let second = TestBuffer::new(16);
-        let released: [&dyn RhiBuffer; 2] = [&first, &second];
+        let released = [&first, &second];
         let commands = [
             Command::CopyBuffer {
                 src: &staging,
@@ -1368,9 +1912,8 @@ mod tests {
             },
         ];
 
-        let (planned, _transaction) = tracker
-            .plan(transfer_queue(), &commands, resolve_queue)
-            .unwrap();
+        let (planned, _transaction, _reservation) =
+            plan(&tracker, &lifetime, transfer_queue(), &commands).unwrap();
         assert!(matches!(
             planned[0],
             PlannedOp::Command(Command::CopyBuffer { .. })
@@ -1391,9 +1934,10 @@ mod tests {
     #[test]
     fn invalid_release_does_not_leave_resources_reserved() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let staging = TestBuffer::new(16);
         let uploaded = TestBuffer::new(16);
-        let released: [&dyn RhiBuffer; 1] = [&uploaded];
+        let released = [&uploaded];
         let invalid = [
             Command::CopyBuffer {
                 src: &staging,
@@ -1408,7 +1952,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            tracker.plan(transfer_queue(), &invalid, resolve_queue),
+            plan(&tracker, &lifetime, transfer_queue(), &invalid),
             Err(RhiError::ResourceState(_))
         ));
 
@@ -1419,37 +1963,38 @@ mod tests {
             dst_offset: 0,
             size: 16,
         }];
-        assert!(tracker
-            .plan(transfer_queue(), &valid, resolve_queue)
-            .is_ok());
+        assert!(plan(&tracker, &lifetime, transfer_queue(), &valid).is_ok());
     }
 
     #[test]
     fn empty_and_duplicate_release_lists_are_rejected() {
         let tracker = Arc::new(ResourceTracker::new());
+        let lifetime = Arc::new(LifetimeTracker::new());
         let buffer = TestBuffer::new(16);
-        let empty: [&dyn RhiBuffer; 0] = [];
-        let duplicates: [&dyn RhiBuffer; 2] = [&buffer, &buffer];
+        let empty: [&Buffer; 0] = [];
+        let duplicates = [&buffer, &buffer];
 
         assert!(matches!(
-            tracker.plan(
+            plan(
+                &tracker,
+                &lifetime,
                 transfer_queue(),
                 &[Command::ReleaseBuffers {
                     buffers: &empty,
                     target: QueueKind::Graphics,
                 }],
-                resolve_queue,
             ),
             Err(RhiError::InvalidCommand(_))
         ));
         assert!(matches!(
-            tracker.plan(
+            plan(
+                &tracker,
+                &lifetime,
                 transfer_queue(),
                 &[Command::ReleaseBuffers {
                     buffers: &duplicates,
                     target: QueueKind::Graphics,
                 }],
-                resolve_queue,
             ),
             Err(RhiError::InvalidCommand(_))
         ));

@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use crate::rhi::{
-    descriptor::RhiDescriptorSet,
+    descriptor::DescriptorSet,
     error::RhiResult,
-    pipeline::RhiPipeline,
+    pipeline::Pipeline,
     queue::QueueKind,
-    resource::{PlannedOp, RhiBuffer, RhiImage, RhiImageView, Transition},
+    resource::{Buffer, Image, ImageView, PlannedOp, Transition},
     shader::ShaderStageFlags,
     types::RhiType,
 };
@@ -15,8 +15,8 @@ pub use crate::rhi::resource::ImageAspect;
 /// One color attachment of a dynamic rendering pass.
 #[derive(Debug, Clone, Copy)]
 pub struct ColorAttachment<'a> {
-    pub view: &'a dyn RhiImageView,
-    pub resolve: Option<&'a dyn RhiImageView>,
+    pub view: &'a ImageView,
+    pub resolve: Option<&'a ImageView>,
     pub load_op: LoadOp,
     pub store_op: StoreOp,
 }
@@ -24,8 +24,8 @@ pub struct ColorAttachment<'a> {
 /// Depth/stencil attachment of a dynamic rendering pass.
 #[derive(Debug, Clone, Copy)]
 pub struct DepthStencilAttachment<'a> {
-    pub view: &'a dyn RhiImageView,
-    pub resolve: Option<&'a dyn RhiImageView>,
+    pub view: &'a ImageView,
+    pub resolve: Option<&'a ImageView>,
     pub depth_load_op: LoadOp,
     pub depth_store_op: StoreOp,
     pub stencil_load_op: LoadOp,
@@ -117,7 +117,7 @@ pub enum IndexType {
 
 /// A backend-neutral command description.
 #[derive(Debug, Clone, Copy)]
-pub enum Command<'a> {
+pub(crate) enum Command<'a> {
     BeginRendering(RenderingDesc<'a>),
     EndRendering,
     Draw {
@@ -134,71 +134,71 @@ pub enum Command<'a> {
         first_instance: u32,
     },
     DrawIndirect {
-        buffer: &'a dyn RhiBuffer,
+        buffer: &'a Buffer,
         offset: u64,
         draw_count: u32,
         stride: u32,
     },
     DrawIndexedIndirect {
-        buffer: &'a dyn RhiBuffer,
+        buffer: &'a Buffer,
         offset: u64,
         draw_count: u32,
         stride: u32,
     },
     Dispatch([u32; 3]),
     DispatchIndirect {
-        buffer: &'a dyn RhiBuffer,
+        buffer: &'a Buffer,
         offset: u64,
     },
     CopyBuffer {
-        src: &'a dyn RhiBuffer,
+        src: &'a Buffer,
         src_offset: u64,
-        dst: &'a dyn RhiBuffer,
+        dst: &'a Buffer,
         dst_offset: u64,
         size: u64,
     },
     CopyBufferToImage {
-        src: &'a dyn RhiBuffer,
-        dst: &'a dyn RhiImage,
+        src: &'a Buffer,
+        dst: &'a Image,
         region: BufferImageCopy,
     },
     CopyImageToBuffer {
-        src: &'a dyn RhiImage,
-        dst: &'a dyn RhiBuffer,
+        src: &'a Image,
+        dst: &'a Buffer,
         region: BufferImageCopy,
     },
     CopyImage {
-        src: &'a dyn RhiImage,
+        src: &'a Image,
         src_region: ImageCopyRegion,
-        dst: &'a dyn RhiImage,
+        dst: &'a Image,
         dst_region: ImageCopyRegion,
         extent: [u32; 3],
     },
     ReleaseBuffers {
-        buffers: &'a [&'a dyn RhiBuffer],
+        buffers: &'a [&'a Buffer],
         target: QueueKind,
     },
     ReleaseImages {
-        images: &'a [&'a dyn RhiImage],
+        images: &'a [&'a Image],
         target: QueueKind,
     },
-    BindPipeline(&'a dyn RhiPipeline),
+    BindPipeline(&'a Pipeline),
     BindVertexBuffers {
         first: u32,
-        buffers: &'a [(&'a dyn RhiBuffer, u64)],
+        buffers: &'a [(&'a Buffer, u64)],
     },
     BindIndexBuffer {
-        buffer: &'a dyn RhiBuffer,
+        buffer: &'a Buffer,
         offset: u64,
         index_type: IndexType,
     },
     BindDescriptorSets {
-        pipeline: &'a dyn RhiPipeline,
+        pipeline: &'a Pipeline,
         first_set: u32,
-        sets: &'a [&'a dyn RhiDescriptorSet],
+        sets: &'a [&'a DescriptorSet],
     },
     PushConstants {
-        pipeline: &'a dyn RhiPipeline,
+        pipeline: &'a Pipeline,
         stages: ShaderStageFlags,
         offset: u32,
         data: &'a [u8],
@@ -254,80 +254,64 @@ pub(crate) trait RhiCommandBuffer: RhiType {
     );
 
     /// Indirect non-indexed draw.
-    fn draw_indirect(&mut self, buffer: &dyn RhiBuffer, offset: u64, draw_count: u32, stride: u32);
+    fn draw_indirect(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32);
 
     /// Indirect indexed draw.
-    fn draw_indexed_indirect(
-        &mut self,
-        buffer: &dyn RhiBuffer,
-        offset: u64,
-        draw_count: u32,
-        stride: u32,
-    );
+    fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32);
 
     /// Compute dispatch.
     fn dispatch(&mut self, group_count: [u32; 3]);
 
     /// Indirect compute dispatch.
-    fn dispatch_indirect(&mut self, buffer: &dyn RhiBuffer, offset: u64);
+    fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64);
 
     /// Copy a range between two buffers.
     fn copy_buffer(
         &mut self,
-        src: &dyn RhiBuffer,
+        src: &Buffer,
         src_offset: u64,
-        dst: &dyn RhiBuffer,
+        dst: &Buffer,
         dst_offset: u64,
         size: u64,
     );
 
     /// Copy one region of a buffer into an image.
-    fn copy_buffer_to_image(
-        &mut self,
-        src: &dyn RhiBuffer,
-        dst: &dyn RhiImage,
-        region: &BufferImageCopy,
-    );
+    fn copy_buffer_to_image(&mut self, src: &Buffer, dst: &Image, region: &BufferImageCopy);
 
     /// Copy one region of an image into a buffer.
-    fn copy_image_to_buffer(
-        &mut self,
-        src: &dyn RhiImage,
-        dst: &dyn RhiBuffer,
-        region: &BufferImageCopy,
-    );
+    fn copy_image_to_buffer(&mut self, src: &Image, dst: &Buffer, region: &BufferImageCopy);
 
     /// Copy a box between two images.
     fn copy_image(
         &mut self,
-        src: &dyn RhiImage,
+        src: &Image,
         src_region: &ImageCopyRegion,
-        dst: &dyn RhiImage,
+        dst: &Image,
         dst_region: &ImageCopyRegion,
         extent: [u32; 3],
     );
 
     /// Bind a graphics or compute pipeline.
-    fn bind_pipeline(&mut self, pipeline: &dyn RhiPipeline);
+    fn bind_pipeline(&mut self, pipeline: &Pipeline);
 
     /// Bind vertex buffers starting at slot `first`.
-    fn bind_vertex_buffers(&mut self, first: u32, buffers: &[(&dyn RhiBuffer, u64)]);
+    fn bind_vertex_buffers(&mut self, first: u32, buffers: &[(&Buffer, u64)]);
 
     /// Bind the index buffer.
-    fn bind_index_buffer(&mut self, buffer: &dyn RhiBuffer, offset: u64, index_type: IndexType);
+    fn bind_index_buffer(&mut self, buffer: &Buffer, offset: u64, index_type: IndexType);
 
     /// Bind descriptor sets for the pipeline's layout.
     fn bind_descriptor_sets(
         &mut self,
-        pipeline: &dyn RhiPipeline,
+        pipeline: &Pipeline,
         first_set: u32,
-        sets: &[&dyn RhiDescriptorSet],
+        sets: &[&DescriptorSet],
     );
 
     /// Push shader constants for the given stages.
     fn push_constants(
         &mut self,
-        pipeline: &dyn RhiPipeline,
+        pipeline: &Pipeline,
         stages: ShaderStageFlags,
         offset: u32,
         data: &[u8],

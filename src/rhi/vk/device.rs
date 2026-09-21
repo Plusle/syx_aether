@@ -1,18 +1,24 @@
 #![allow(dead_code)]
 
-use super::{
-    allocator::Allocator,
-    instance::Instance,
-    queue::{VkCommandQueue, VkQueueInfo, VkQueueRegistry},
-    resource::{VkBuffer, VkImage, VkImageView, VkSampler},
-};
-use crate::rhi::{
-    backend::RhiBackend,
-    error::{RhiError, RhiResult},
-    queue::{QueueId, QueueKind, RhiQueue},
-    resource::{ResourceTracker, RhiBuffer, RhiImage, RhiImageView, RhiSampler},
-    sync::SyncPoint,
-    types::{BufferDesc, ImageDesc, ImageViewDesc, SamplerDesc},
+use crate::{
+    rhi::{
+        backend::RhiBackend,
+        descriptor::RhiDescriptorSet,
+        error::{RhiError, RhiResult},
+        lifetime::{lifetime_tracker, DiscardManager, LifetimeTracker, RhiObject},
+        pipeline::RhiPipeline,
+        queue::{QueueId, QueueKind, RhiQueue},
+        resource::{ResourceTracker, RhiBuffer, RhiImage, RhiImageView, RhiSampler},
+        sync::SyncPoint,
+        types::{BufferDesc, ImageDesc, ImageViewDesc, SamplerDesc},
+        vk::{
+            allocator::Allocator,
+            instance::Instance,
+            queue::{VkCommandQueue, VkQueueInfo, VkQueueRegistry},
+            resource::{VkBuffer, VkImage, VkImageView, VkSampler},
+        },
+    },
+    util::log,
 };
 use ash::{vk, vk::Handle};
 use std::{
@@ -22,7 +28,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::{info, warn};
 
 pub struct Device {
     // Held only to keep the instance alive for the device's lifetime.
@@ -34,13 +39,7 @@ pub struct Device {
     pub buffer_device_address: bool,
     allocator: Option<Allocator>,
     pub(crate) tracker: Arc<ResourceTracker>,
-    discarded_buffers: Mutex<Vec<DiscardedBuffer>>,
-}
-
-struct DiscardedBuffer {
-    id: crate::rhi::resource::ResourceId,
-    handle: vk::Buffer,
-    allocation: vma::Allocation,
+    pub(crate) lifetime: Arc<LifetimeTracker>,
 }
 
 impl Device {
@@ -69,7 +68,7 @@ impl Device {
             }) {
                 Some(index) => index as u32,
                 None => {
-                    warn!("Skipping {}: no graphics+compute queue family", device_name);
+                    log::warn!("Skipping {}: no graphics+compute queue family", device_name);
                     continue;
                 }
             };
@@ -98,7 +97,7 @@ impl Device {
                 .push_next(&mut features13);
             unsafe { inst.get_physical_device_features2(physical_device, &mut features2) };
             if features12.timeline_semaphore == vk::FALSE {
-                warn!(
+                log::warn!(
                     "Skipping {}: timeline semaphores not supported",
                     device_name
                 );
@@ -108,14 +107,14 @@ impl Device {
                 || features13.dynamic_rendering == vk::FALSE
                 || features13.synchronization2 == vk::FALSE
             {
-                warn!(
+                log::warn!(
                     "Skipping {}: Vulkan 1.3 dynamic rendering/synchronization2 not supported",
                     device_name
                 );
                 continue;
             }
 
-            info!("Selected GPU: {}", device_name);
+            log::info!("Selected GPU: {}", device_name);
             selected = Some((
                 physical_device,
                 graphics_family,
@@ -181,7 +180,7 @@ impl Device {
             buffer_device_address,
             allocator: Some(allocator),
             tracker: Arc::new(ResourceTracker::new()),
-            discarded_buffers: Mutex::new(Vec::new()),
+            lifetime: lifetime_tracker(),
         })
     }
 
@@ -190,61 +189,12 @@ impl Device {
             .as_ref()
             .expect("Vulkan allocator must exist while Device is alive")
     }
-
-    pub(crate) fn defer_buffer(
-        &self,
-        id: crate::rhi::resource::ResourceId,
-        handle: vk::Buffer,
-        allocation: vma::Allocation,
-    ) {
-        self.tracker.retire(id);
-        self.discarded_buffers
-            .lock()
-            .expect("discard pool poisoned")
-            .push(DiscardedBuffer {
-                id,
-                handle,
-                allocation,
-            });
-    }
-
-    pub fn collect_garbage(&self) {
-        let mut discarded = self
-            .discarded_buffers
-            .lock()
-            .expect("discard pool poisoned");
-        let mut index = 0;
-        while index < discarded.len() {
-            let ready = self.tracker.can_destroy(discarded[index].id, |point| {
-                let semaphore = vk::Semaphore::from_raw(point.timeline());
-                unsafe { self.device.get_semaphore_counter_value(semaphore) }
-                    .is_ok_and(|completed| completed >= point.value())
-            });
-            if ready {
-                let mut buffer = discarded.swap_remove(index);
-                self.allocator()
-                    .destroy_buffer(buffer.handle, &mut buffer.allocation);
-                self.tracker.forget(buffer.id);
-            } else {
-                index += 1;
-            }
-        }
-    }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-        }
-        let discarded = std::mem::take(
-            self.discarded_buffers
-                .get_mut()
-                .expect("discard pool poisoned"),
-        );
-        for mut buffer in discarded {
-            self.allocator()
-                .destroy_buffer(buffer.handle, &mut buffer.allocation);
         }
         // The allocator owns Vulkan memory blocks and must release them while
         // the logical device is still alive.
@@ -253,14 +203,14 @@ impl Drop for Device {
 
         unsafe {
             self.device.destroy_device(None);
-            info!("Vulkan logical device destroyed");
+            log::info!("Vulkan logical device destroyed");
         }
     }
 }
 
 pub struct VulkanDevice {
-    graphics_queue: VkCommandQueue,
-    transfer_queue: VkCommandQueue,
+    graphics_queue: Arc<VkCommandQueue>,
+    transfer_queue: Arc<VkCommandQueue>,
     ctx: Arc<Device>,
     timelines: HashSet<vk::Semaphore>,
 }
@@ -295,20 +245,20 @@ impl VulkanDevice {
         } else {
             Arc::new(Mutex::new(()))
         };
-        let graphics_queue = VkCommandQueue::new(
+        let graphics_queue = Arc::new(VkCommandQueue::new(
             Arc::clone(&ctx),
             graphics_info,
             Arc::clone(&ctx.tracker),
             Arc::clone(&registry),
             graphics_submit_gate,
-        )?;
-        let transfer_queue = VkCommandQueue::new(
+        )?);
+        let transfer_queue = Arc::new(VkCommandQueue::new(
             Arc::clone(&ctx),
             transfer_info,
             Arc::clone(&ctx.tracker),
             registry,
             transfer_submit_gate,
-        )?;
+        )?);
         let timelines = HashSet::from([graphics_queue.timeline(), transfer_queue.timeline()]);
         Ok(Self {
             graphics_queue,
@@ -319,7 +269,11 @@ impl VulkanDevice {
     }
 
     pub fn collect_garbage(&self) {
-        self.ctx.collect_garbage();
+        DiscardManager::global().flush(self, |point| {
+            let semaphore = vk::Semaphore::from_raw(point.timeline());
+            unsafe { self.ctx.device.get_semaphore_counter_value(semaphore) }
+                .is_ok_and(|completed| completed >= point.value())
+        });
     }
 }
 
@@ -341,11 +295,12 @@ impl Drop for VulkanDevice {
 }
 
 impl RhiBackend for VulkanDevice {
-    fn queue(&self, kind: QueueKind) -> RhiResult<&dyn RhiQueue> {
-        Ok(match kind {
-            QueueKind::Graphics => &self.graphics_queue,
-            QueueKind::Transfer => &self.transfer_queue,
-        })
+    fn queue(&self, kind: QueueKind) -> RhiResult<Arc<dyn RhiQueue>> {
+        let queue: Arc<dyn RhiQueue> = match kind {
+            QueueKind::Graphics => self.graphics_queue.clone(),
+            QueueKind::Transfer => self.transfer_queue.clone(),
+        };
+        Ok(queue)
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> RhiResult<Arc<dyn RhiBuffer>> {
@@ -368,18 +323,24 @@ impl RhiBackend for VulkanDevice {
         Err(RhiError::Unimplemented)
     }
 
+    fn create_pipeline(&self) -> RhiResult<Arc<dyn RhiPipeline>> {
+        Err(RhiError::Unimplemented)
+    }
+
+    fn create_descriptor_set(&self) -> RhiResult<Arc<dyn RhiDescriptorSet>> {
+        Err(RhiError::Unimplemented)
+    }
+
     fn destroy_buffer(&self, payload: Arc<dyn RhiBuffer>) {
-        // `as_any` exposes the concrete value behind `dyn RhiBuffer`, and
-        // `downcast_ref` checks its type before returning a borrowed VkBuffer.
-        let Some(_buffer) = payload.as_any().downcast_ref::<VkBuffer>() else {
+        let Some(buffer) = payload.as_any().downcast_ref::<VkBuffer>() else {
             debug_assert!(
                 false,
                 "destroy_buffer called with non-Vulkan buffer payload"
             );
             return;
         };
-
-        // Use `_buffer` here to destroy its Vulkan handle once VkBuffer owns one.
+        buffer.destroy();
+        self.ctx.tracker.forget(buffer.id());
     }
 
     fn destroy_image(&self, payload: Arc<dyn RhiImage>) {
@@ -400,6 +361,15 @@ impl RhiBackend for VulkanDevice {
             "destroy_image_view called with non-Vulkan image-view payload"
         );
     }
+
+    fn destroy_pipeline(&self, _pipeline: Arc<dyn RhiPipeline>) {
+        todo!()
+    }
+
+    fn destroy_descriptor_set(&self, _descriptor_set: Arc<dyn RhiDescriptorSet>) {
+        todo!()
+    }
+
     fn wait(&self, point: SyncPoint, timeout: Option<Duration>) -> RhiResult<()> {
         let semaphore = vk::Semaphore::from_raw(point.timeline());
         #[cfg(debug_assertions)]

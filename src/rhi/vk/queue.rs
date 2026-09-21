@@ -1,23 +1,21 @@
 #![allow(dead_code)]
 
-use super::{
-    command::VkCommandBuffer,
-    descriptor::VkDescriptorSet,
-    device::Device,
-    pipeline::VkPipeline,
-    resource::{VkBuffer, VkImage, VkImageView},
-};
 use crate::rhi::{
     command::{Command, RhiCommandBuffer},
-    descriptor::RhiDescriptorSet,
+    descriptor::{DescriptorSet, RhiDescriptorSet},
     error::{RhiError, RhiResult},
-    pipeline::RhiPipeline,
-    queue::{
-        self, validate_queue_capabilities, BuiltRecorder, QueueBackend, QueueId, QueueKind,
-        Recorder, RhiQueue, Sealed,
-    },
-    resource::{RhiBuffer, RhiImage, RhiImageView},
+    lifetime::LifetimeTracker,
+    pipeline::{Pipeline, RhiPipeline},
+    queue::{validate_queue_capabilities, QueueId, QueueKind, RhiQueue},
+    resource::{Buffer, Image, ImageView, ResourceTracker, RhiBuffer, RhiImage, RhiImageView},
     sync::SyncPoint,
+    vk::{
+        command::VkCommandBuffer,
+        descriptor::VkDescriptorSet,
+        device::Device,
+        pipeline::VkPipeline,
+        resource::{VkBuffer, VkImage, VkImageView},
+    },
 };
 use ash::{vk, vk::Handle};
 use std::{
@@ -93,7 +91,7 @@ pub(crate) struct VkCommandQueue {
     command_buffers: Mutex<CommandBuffers>,
     lease: Mutex<()>,
     submit_gate: Arc<Mutex<()>>,
-    tracker: Arc<crate::rhi::resource::ResourceTracker>,
+    tracker: Arc<ResourceTracker>,
     queues: Arc<VkQueueRegistry>,
 }
 
@@ -101,7 +99,7 @@ impl VkCommandQueue {
     pub(crate) fn new(
         ctx: Arc<Device>,
         info: VkQueueInfo,
-        tracker: Arc<crate::rhi::resource::ResourceTracker>,
+        tracker: Arc<ResourceTracker>,
         queues: Arc<VkQueueRegistry>,
         submit_gate: Arc<Mutex<()>>,
     ) -> RhiResult<Self> {
@@ -235,9 +233,11 @@ impl Debug for VkCommandQueue {
     }
 }
 
-impl Sealed for VkCommandQueue {}
+impl RhiQueue for VkCommandQueue {
+    fn kind(&self) -> QueueKind {
+        self.info.kind
+    }
 
-impl QueueBackend for VkCommandQueue {
     fn id(&self) -> QueueId {
         self.info.id
     }
@@ -246,8 +246,12 @@ impl QueueBackend for VkCommandQueue {
         &self.lease
     }
 
-    fn tracker(&self) -> &Arc<crate::rhi::resource::ResourceTracker> {
+    fn tracker(&self) -> &Arc<ResourceTracker> {
         &self.tracker
+    }
+
+    fn lifetime(&self) -> &Arc<LifetimeTracker> {
+        &self.ctx.lifetime
     }
 
     fn resolve_queue(&self, kind: QueueKind) -> RhiResult<QueueId> {
@@ -345,30 +349,6 @@ impl QueueBackend for VkCommandQueue {
             .collect();
         buffers.unused.extend(completed_buffers);
         Ok(())
-    }
-}
-
-impl RhiQueue for VkCommandQueue {
-    fn kind(&self) -> QueueKind {
-        self.info.kind
-    }
-
-    fn recorder<'queue, 'command>(&'queue self) -> RhiResult<Recorder<'queue, 'command>> {
-        queue::recorder(self)
-    }
-
-    fn try_recorder<'queue, 'command>(
-        &'queue self,
-    ) -> RhiResult<Option<Recorder<'queue, 'command>>> {
-        queue::try_recorder(self)
-    }
-
-    fn submit(&self, recorder: BuiltRecorder<'_>) -> RhiResult<SyncPoint> {
-        queue::submit(self, recorder)
-    }
-
-    fn force_flush(&self) -> RhiResult<()> {
-        queue::force_flush(self)
     }
 }
 
@@ -473,6 +453,11 @@ fn validate_vk_commands(commands: &[Command<'_>]) -> RhiResult<()> {
 }
 
 fn validate_buffer(buffer: &dyn RhiBuffer) -> RhiResult<()> {
+    let buffer = buffer
+        .as_any()
+        .downcast_ref::<Buffer>()
+        .map(Buffer::inner)
+        .unwrap_or(buffer);
     if buffer.as_any().is::<VkBuffer>() {
         Ok(())
     } else {
@@ -483,6 +468,11 @@ fn validate_buffer(buffer: &dyn RhiBuffer) -> RhiResult<()> {
 }
 
 fn validate_image(image: &dyn RhiImage) -> RhiResult<()> {
+    let image = image
+        .as_any()
+        .downcast_ref::<Image>()
+        .map(Image::inner)
+        .unwrap_or(image);
     if image.as_any().is::<VkImage>() {
         Ok(())
     } else {
@@ -493,6 +483,11 @@ fn validate_image(image: &dyn RhiImage) -> RhiResult<()> {
 }
 
 fn validate_view(view: &dyn RhiImageView) -> RhiResult<()> {
+    let view = view
+        .as_any()
+        .downcast_ref::<ImageView>()
+        .map(ImageView::inner)
+        .unwrap_or(view);
     if view.as_any().is::<VkImageView>() {
         Ok(())
     } else {
@@ -503,6 +498,11 @@ fn validate_view(view: &dyn RhiImageView) -> RhiResult<()> {
 }
 
 fn validate_pipeline(pipeline: &dyn RhiPipeline) -> RhiResult<()> {
+    let pipeline = pipeline
+        .as_any()
+        .downcast_ref::<Pipeline>()
+        .map(Pipeline::inner)
+        .unwrap_or(pipeline);
     if pipeline.as_any().is::<VkPipeline>() {
         Ok(())
     } else {
@@ -513,6 +513,11 @@ fn validate_pipeline(pipeline: &dyn RhiPipeline) -> RhiResult<()> {
 }
 
 fn validate_descriptor_set(set: &dyn RhiDescriptorSet) -> RhiResult<()> {
+    let set = set
+        .as_any()
+        .downcast_ref::<DescriptorSet>()
+        .map(DescriptorSet::inner)
+        .unwrap_or(set);
     if set.as_any().is::<VkDescriptorSet>() {
         Ok(())
     } else {
@@ -525,18 +530,20 @@ fn validate_descriptor_set(set: &dyn RhiDescriptorSet) -> RhiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rhi::resource::ResourceId;
+    use crate::rhi::lifetime::{ObjectId, RhiObject};
 
     #[derive(Debug)]
     struct ForeignBuffer {
-        id: ResourceId,
+        id: ObjectId,
+    }
+
+    impl RhiObject for ForeignBuffer {
+        fn id(&self) -> ObjectId {
+            self.id
+        }
     }
 
     impl RhiBuffer for ForeignBuffer {
-        fn id(&self) -> ResourceId {
-            self.id
-        }
-
         fn name(&self) -> &str {
             "foreign"
         }
@@ -548,9 +555,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_foreign_buffer_before_vulkan_recording() {
-        let foreign = ForeignBuffer {
-            id: ResourceId::allocate(),
-        };
+        let foreign = Buffer::from_inner(Arc::new(ForeignBuffer {
+            id: ObjectId::allocate(),
+        }));
         let commands = [Command::CopyBuffer {
             src: &foreign,
             src_offset: 0,

@@ -2,6 +2,7 @@ pub mod backend;
 pub mod command;
 pub mod descriptor;
 pub mod error;
+pub mod lifetime;
 pub mod pipeline;
 pub mod queue;
 pub mod resource;

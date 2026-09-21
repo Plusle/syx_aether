@@ -3,23 +3,26 @@
 use super::device::Device;
 use crate::rhi::{
     error::{RhiError, RhiResult},
-    resource::{ImageSubresourceRange, ResourceId, RhiBuffer, RhiImage, RhiImageView, RhiSampler},
+    lifetime::{ObjectId, RhiObject},
+    resource::{
+        ImageSubresourceInfo, ImageSubresourceRange, RhiBuffer, RhiImage, RhiImageView, RhiSampler,
+    },
     types::{BufferDesc, BufferUsage, CpuAccess},
 };
 use ash::vk;
 use std::{
     fmt::{Debug, Formatter},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use vma::{Allocation, AllocationCreateFlags, AllocationCreateInfo, MemoryUsage};
 
 pub(crate) struct VkBuffer {
-    id: ResourceId,
+    id: ObjectId,
     ctx: Arc<Device>,
     name: String,
     size: u64,
     handle: vk::Buffer,
-    allocation: Option<Allocation>,
+    allocation: Mutex<Option<Allocation>>,
 }
 
 impl VkBuffer {
@@ -74,17 +77,30 @@ impl VkBuffer {
             .create_buffer(&create_info, &allocation_info)?;
 
         Ok(Self {
-            id: ResourceId::allocate(),
+            id: ObjectId::allocate(),
             ctx,
             name: desc.name,
             size: desc.size,
             handle,
-            allocation: Some(allocation),
+            allocation: Mutex::new(Some(allocation)),
         })
     }
 
     pub(crate) fn handle(&self) -> vk::Buffer {
         self.handle
+    }
+
+    pub(crate) fn destroy(&self) {
+        if let Some(mut allocation) = self
+            .allocation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            self.ctx
+                .allocator()
+                .destroy_buffer(self.handle, &mut allocation);
+        }
     }
 }
 
@@ -97,25 +113,19 @@ impl Debug for VkBuffer {
     }
 }
 
-impl RhiBuffer for VkBuffer {
-    fn id(&self) -> ResourceId {
+impl RhiObject for VkBuffer {
+    fn id(&self) -> ObjectId {
         self.id
     }
+}
 
+impl RhiBuffer for VkBuffer {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn size(&self) -> u64 {
         self.size
-    }
-}
-
-impl Drop for VkBuffer {
-    fn drop(&mut self) {
-        if let Some(allocation) = self.allocation.take() {
-            self.ctx.defer_buffer(self.id, self.handle, allocation);
-        }
     }
 }
 
@@ -181,8 +191,9 @@ mod tests {
 
 #[derive(Debug)]
 pub(crate) struct VkImage {
-    pub(crate) id: ResourceId,
+    pub(crate) id: ObjectId,
     pub(crate) handle: vk::Image,
+    pub(crate) subresource_info: ImageSubresourceInfo,
 }
 
 impl VkImage {
@@ -191,21 +202,35 @@ impl VkImage {
     }
 }
 
-impl RhiImage for VkImage {
-    fn id(&self) -> ResourceId {
+impl RhiObject for VkImage {
+    fn id(&self) -> ObjectId {
         self.id
     }
 }
 
+impl RhiImage for VkImage {
+    fn subresource_info(&self) -> ImageSubresourceInfo {
+        self.subresource_info
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct VkSampler {}
+pub(crate) struct VkSampler {
+    pub(crate) id: ObjectId,
+}
+
+impl RhiObject for VkSampler {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+}
 
 impl RhiSampler for VkSampler {}
 
 #[derive(Debug)]
 pub(crate) struct VkImageView {
-    pub(crate) image_id: ResourceId,
-    pub(crate) image_handle: vk::Image,
+    pub(crate) id: ObjectId,
+    pub(crate) image: Arc<dyn RhiImage>,
     pub(crate) range: ImageSubresourceRange,
     pub(crate) handle: vk::ImageView,
 }
@@ -216,9 +241,15 @@ impl VkImageView {
     }
 }
 
+impl RhiObject for VkImageView {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+}
+
 impl RhiImageView for VkImageView {
-    fn image_id(&self) -> ResourceId {
-        self.image_id
+    fn image(&self) -> &dyn RhiImage {
+        self.image.as_ref()
     }
 
     fn subresource_range(&self) -> ImageSubresourceRange {
