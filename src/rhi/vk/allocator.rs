@@ -2,10 +2,6 @@ use crate::rhi::error::{RhiError, RhiResult};
 use ash::vk;
 use vma::{Alloc, Allocation, AllocationCreateInfo, AllocatorCreateFlags, AllocatorCreateInfo};
 
-/// Owns the Vulkan Memory Allocator instance used by this device.
-///
-/// VMA performs its own synchronization unless created with
-/// `EXTERNALLY_SYNCHRONIZED`, which this wrapper intentionally does not set.
 pub(crate) struct Allocator {
     allocator: vma::Allocator,
 }

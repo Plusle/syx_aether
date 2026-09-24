@@ -14,7 +14,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// One image aspect selected by an operation or view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ImageAspect {
     Color,
@@ -23,7 +22,6 @@ pub enum ImageAspect {
 }
 
 bitflags::bitflags! {
-    /// Image aspects available on one image resource.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ImageAspectFlags: u8 {
         const COLOR = 1 << 0;
@@ -42,7 +40,6 @@ impl From<ImageAspect> for ImageAspectFlags {
     }
 }
 
-/// Backend-neutral bounds needed to validate and track image subresources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageSubresourceInfo {
     pub aspects: ImageAspectFlags,
@@ -50,7 +47,6 @@ pub struct ImageSubresourceInfo {
     pub array_layers: u32,
 }
 
-/// Backend-neutral image subresource range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageSubresourceRange {
     aspect: ImageAspect,
@@ -61,8 +57,6 @@ pub struct ImageSubresourceRange {
 }
 
 impl ImageSubresourceRange {
-    /// Creates a nonempty range whose end coordinates do not overflow.
-    /// Resource-specific bounds are checked by [`Self::validate`].
     pub fn new(
         aspect: ImageAspect,
         base_mip: u32,
@@ -101,7 +95,6 @@ impl ImageSubresourceRange {
         self.layer_count
     }
 
-    /// Validates this range against one image's subresource bounds.
     pub fn validate(self, info: ImageSubresourceInfo) -> RhiResult<()> {
         self.validated(info).map(|_| ())
     }
@@ -211,7 +204,6 @@ pub(crate) trait RhiImageView: RhiObject {
     }
 }
 
-/// Owning, backend-neutral buffer handle.
 #[derive(Debug)]
 pub struct Buffer {
     inner: Option<Arc<dyn RhiBuffer>>,
@@ -230,6 +222,14 @@ impl Buffer {
         self.inner
             .as_deref()
             .expect("live buffer owns its backend object")
+    }
+
+    pub fn name(&self) -> &str {
+        self.inner().name()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.inner().size()
     }
 }
 
@@ -257,7 +257,6 @@ impl Drop for Buffer {
     }
 }
 
-/// Owning, backend-neutral image handle.
 #[derive(Debug)]
 pub struct Image {
     inner: Option<Arc<dyn RhiImage>>,
@@ -285,6 +284,10 @@ impl Image {
                 .expect("live image owns its backend object"),
         )
     }
+
+    pub fn subresource_info(&self) -> ImageSubresourceInfo {
+        self.inner().subresource_info()
+    }
 }
 
 impl RhiObject for Image {
@@ -307,7 +310,6 @@ impl Drop for Image {
     }
 }
 
-/// Owning, backend-neutral sampler handle.
 #[derive(Debug)]
 pub struct Sampler {
     inner: Option<Arc<dyn RhiSampler>>,
@@ -322,7 +324,7 @@ impl Sampler {
         Self { inner: Some(inner) }
     }
 
-    fn inner(&self) -> &dyn RhiSampler {
+    pub(crate) fn inner(&self) -> &dyn RhiSampler {
         self.inner
             .as_deref()
             .expect("live sampler owns its backend object")
@@ -345,7 +347,6 @@ impl Drop for Sampler {
     }
 }
 
-/// Owning, backend-neutral image-view handle.
 #[derive(Debug)]
 pub struct ImageView {
     inner: Option<Arc<dyn RhiImageView>>,
@@ -364,6 +365,10 @@ impl ImageView {
         self.inner
             .as_deref()
             .expect("live image view owns its backend object")
+    }
+
+    pub fn subresource_range(&self) -> ImageSubresourceRange {
+        self.inner().subresource_range()
     }
 }
 
@@ -392,7 +397,7 @@ impl Drop for ImageView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ResourceRange {
+pub(crate) enum ResourceRange {
     Buffer { offset: u64, size: u64 },
     Image(ImageSubresourceRange),
 }
@@ -562,14 +567,13 @@ struct TrackedResource {
     states: TrackedStates,
 }
 
-/// Device-global scheduled buffer/image state used for barrier planning.
 #[derive(Debug, Default)]
-pub struct ResourceTracker {
+pub(crate) struct ResourceTracker {
     resources: Mutex<HashMap<ObjectId, TrackedResource>>,
 }
 
 impl ResourceTracker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -1088,12 +1092,12 @@ fn analyze<'a>(commands: &[Command<'a>]) -> RhiResult<Vec<AnalyzedOp<'a>>> {
             | Command::DrawIndexed { .. }
             | Command::DrawIndirect { .. }
             | Command::DrawIndexedIndirect { .. }
-                if !rendering =>
-            {
-                return Err(RhiError::InvalidCommand(
-                    "draw commands must be inside a rendering pass".into(),
-                ));
-            }
+            if !rendering =>
+                {
+                    return Err(RhiError::InvalidCommand(
+                        "draw commands must be inside a rendering pass".into(),
+                    ));
+                }
             Command::Dispatch(_) | Command::DispatchIndirect { .. } if rendering => {
                 return Err(RhiError::InvalidCommand(
                     "dispatch commands must be outside a rendering pass".into(),
@@ -1252,7 +1256,7 @@ fn image_use(
         base_layer: layers.base_layer,
         layer_count: layers.layer_count,
     }
-    .validated(info)?;
+        .validated(info)?;
     Ok(ResourceUse {
         resource,
         range: ValidResourceRange::Image(range),
@@ -1375,16 +1379,20 @@ mod tests {
     }
 
     impl TestImage {
-        #[allow(clippy::new_ret_no_self)]
-        fn new() -> Image {
-            Image::from_inner(Arc::new(Self {
+        fn backend() -> Arc<dyn RhiImage> {
+            Arc::new(Self {
                 id: ObjectId::allocate(),
                 info: ImageSubresourceInfo {
                     aspects: ImageAspectFlags::COLOR,
                     mip_levels: 4,
                     array_layers: 4,
                 },
-            }))
+            })
+        }
+
+        #[allow(clippy::new_ret_no_self)]
+        fn new() -> Image {
+            Image::from_inner(Self::backend())
         }
     }
 
@@ -1398,6 +1406,54 @@ mod tests {
         fn subresource_info(&self) -> ImageSubresourceInfo {
             self.info
         }
+    }
+
+    #[derive(Debug)]
+    struct TestImageView {
+        id: ObjectId,
+        image: Arc<dyn RhiImage>,
+        range: ImageSubresourceRange,
+    }
+
+    impl RhiObject for TestImageView {
+        fn id(&self) -> ObjectId {
+            self.id
+        }
+    }
+
+    impl RhiImageView for TestImageView {
+        fn image(&self) -> &dyn RhiImage {
+            self.image.as_ref()
+        }
+
+        fn subresource_range(&self) -> ImageSubresourceRange {
+            self.range
+        }
+    }
+
+    #[test]
+    fn public_wrapper_queries_forward_to_backend_objects() {
+        let buffer = TestBuffer::new(64);
+        assert_eq!(buffer.name(), "test");
+        assert_eq!(buffer.size(), 64);
+
+        let image = TestImage::new();
+        assert_eq!(
+            image.subresource_info(),
+            ImageSubresourceInfo {
+                aspects: ImageAspectFlags::COLOR,
+                mip_levels: 4,
+                array_layers: 4,
+            }
+        );
+
+        let range = ImageSubresourceRange::new(ImageAspect::Color, 1, 2, 0, 3).unwrap();
+        let view = ImageView::from_inner(Arc::new(TestImageView {
+            id: ObjectId::allocate(),
+            image: TestImage::backend(),
+            range,
+        }));
+        assert_eq!(view.subresource_range(), range);
     }
 
     #[test]
@@ -1497,13 +1553,13 @@ mod tests {
                     transition.resource.id() == destination.id()
                         && transition.before.is_none()
                         && transition.range
-                            == ResourceRange::Image(ImageSubresourceRange {
-                                aspect: ImageAspect::Color,
-                                base_mip: mip,
-                                mip_count: 1,
-                                base_layer: 0,
-                                layer_count: 1,
-                            })
+                        == ResourceRange::Image(ImageSubresourceRange {
+                        aspect: ImageAspect::Color,
+                        base_mip: mip,
+                        mip_count: 1,
+                        base_layer: 0,
+                        layer_count: 1,
+                    })
                 }),
                 PlannedOp::Command(_) => false,
             })
@@ -1631,11 +1687,16 @@ mod tests {
 
         let (_, transaction, reservation) =
             plan(&tracker, &lifetime, graphics_queue(), &commands).unwrap();
-        let point = SyncPoint::new(7, 3);
+        let point = SyncPoint::new(graphics_queue(), 7, 3);
         transaction.commit();
         reservation.commit(point);
         assert_eq!(lifetime.last_uses(a.id()), vec![point]);
         assert_eq!(lifetime.last_uses(b.id()), vec![point]);
+
+        let next = SyncPoint::new(graphics_queue(), 9, 4);
+        lifetime.reserve([a.id(), b.id()]).unwrap().commit(next);
+        assert_eq!(lifetime.last_uses(a.id()), vec![next]);
+        assert_eq!(lifetime.last_uses(b.id()), vec![next]);
     }
 
     #[test]
@@ -1693,7 +1754,7 @@ mod tests {
         ];
         let (_, transfer_transaction, transfer_reservation) =
             plan(&tracker, &lifetime, transfer_queue(), &transfer_commands).unwrap();
-        let transfer_point = SyncPoint::new(11, 4);
+        let transfer_point = SyncPoint::new(transfer_queue(), 11, 4);
         transfer_transaction.commit();
         transfer_reservation.commit(transfer_point);
 
@@ -1760,7 +1821,7 @@ mod tests {
                 size: 64
             }
         );
-        let transfer_point = SyncPoint::new(17, 3);
+        let transfer_point = SyncPoint::new(transfer_queue(), 17, 3);
         transfer_transaction.commit();
         transfer_reservation.commit(transfer_point);
 
@@ -1835,7 +1896,7 @@ mod tests {
         ];
         let (transfer_plan, transfer_transaction, transfer_reservation) =
             plan(&tracker, &lifetime, transfer_queue(), &transfer_commands).unwrap();
-        let transfer_point = SyncPoint::new(19, 2);
+        let transfer_point = SyncPoint::new(transfer_queue(), 19, 2);
         transfer_transaction.commit();
         transfer_reservation.commit(transfer_point);
 

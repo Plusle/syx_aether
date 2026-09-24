@@ -33,14 +33,12 @@ pub enum BackendType {
     D3D12,
 }
 
-/// Public backend handle. Backend-specific traits remain crate-private.
 #[derive(Debug, Clone)]
 pub struct Backend {
     inner: Arc<dyn RhiBackend>,
 }
 
 impl Backend {
-    /// Returns the initialized backend handle.
     pub fn global() -> RhiResult<Arc<Self>> {
         backend()
     }
@@ -77,13 +75,16 @@ impl Backend {
         ))
     }
 
-    /// Retrieves a logical queue owned by this backend.
     pub fn queue(&self, kind: QueueKind) -> RhiResult<Queue> {
         Ok(Queue::new(self.inner.queue(kind)?))
     }
 
     pub fn wait(&self, point: SyncPoint, timeout: Option<Duration>) -> RhiResult<()> {
         self.inner.wait(point, timeout)
+    }
+
+    pub fn wait_all(&self) -> RhiResult<()> {
+        self.inner.wait_all()
     }
 
     pub(crate) fn inner(&self) -> &dyn RhiBackend {
@@ -113,7 +114,6 @@ pub fn bootstrap(t: BackendType) -> RhiResult<()> {
     Ok(())
 }
 
-/// Returns the initialized backend for internal wrapper construction.
 pub(crate) fn backend() -> RhiResult<Arc<Backend>> {
     backend_slot()
         .read()
@@ -123,11 +123,6 @@ pub(crate) fn backend() -> RhiResult<Arc<Backend>> {
         .ok_or_else(|| RhiError::BackendError("the RHI backend is not initialized".into()))
 }
 
-/// Removes the globally owned backend reference.
-///
-/// Backend destruction occurs when this was its final `Arc` reference. This
-/// makes termination safe even when a caller still owns a backend handle or a
-/// backend resource.
 pub fn terminate() -> RhiResult<()> {
     let backend = backend_slot()
         .read()
@@ -135,13 +130,14 @@ pub fn terminate() -> RhiResult<()> {
         .as_ref()
         .cloned();
     if let Some(backend) = backend.as_deref() {
-        DiscardManager::global().destroy_all(backend.inner());
+        backend.wait_all()?;
+        DiscardManager::global().destroy_all()?;
     }
-    let _backend = backend_slot()
+    let b = backend_slot()
         .write()
         .map_err(|_| RhiError::BackendError("global backend lock poisoned".into()))?
         .take();
-    drop(_backend);
+    drop(b);
     Ok(())
 }
 
@@ -167,4 +163,5 @@ pub(crate) trait RhiBackend: RhiType {
     fn destroy_descriptor_set(&self, descriptor_set: Arc<dyn RhiDescriptorSet>);
 
     fn wait(&self, point: SyncPoint, timeout: Option<Duration>) -> RhiResult<()>;
+    fn wait_all(&self) -> RhiResult<()>;
 }

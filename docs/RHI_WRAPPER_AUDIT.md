@@ -12,19 +12,19 @@ pub struct Object {
 
 公开 concrete wrapper 负责用户接口和所有权；`Rhi*` trait、trait object 与 native backend 对象只在 crate 内部使用。
 
-## 待重构清单
+## 审查清单
 
 | 优先级 | 对象或区域 | 当前问题 | 建议 |
 | --- | --- | --- | --- |
-| P0 | `SyncPoint` | 公开构造和读取裸 `timeline: u64`，允许用户伪造并泄漏 native handle | 保持轻量 `Copy` 值类型，但加入 `QueueId` 并收紧构造与 native accessor |
-| P1 | `rhi::vk` | Vulkan 模块以及 `Instance`、`Device`、`VulkanDevice` 对外公开 | 将 Vulkan 实现层收紧为 crate-private |
-| P1 | 资源 wrapper 接口 | `Buffer::size/name` 等能力只存在于 private trait，外部用户无法调用 | 在 concrete wrapper 上提供公开固有方法并转发 |
-| P2 | tracker 类型 | `ObjectId`、`ResourceRange`、`ResourceTracker` 被公开，但只服务于内部 barrier/lifetime 系统 | 全部收紧为 crate-private |
-| P2 | wrapper 内部接口 | `Sampler::inner()` 的可见性与其他 wrapper 不一致 | 统一为 `pub(crate) fn inner()` |
+| P0（已完成） | `SyncPoint` | 公开构造和读取裸 `timeline: u64`，允许用户伪造并泄漏 native handle | 保持轻量 `Copy` 值类型，但加入 `QueueId` 并收紧构造与 native accessor |
+| P1（已完成） | `rhi::vk` | Vulkan 模块以及 `Instance`、`Device`、`VulkanDevice` 对外公开 | 将 Vulkan 实现层收紧为 crate-private |
+| P1（已完成） | 资源 wrapper 接口 | `Buffer::size/name` 等能力只存在于 private trait，外部用户无法调用 | 在 concrete wrapper 上提供公开固有方法并转发 |
+| P2（已完成） | tracker 类型 | `ObjectId`、`ResourceRange`、`ResourceTracker` 被公开，但只服务于内部 barrier/lifetime 系统 | 全部收紧为 crate-private |
+| P2（已完成） | wrapper 内部接口 | `Sampler::inner()` 的可见性与其他 wrapper 不一致 | 统一为 `pub(crate) fn inner()` |
 
-## 1. `SyncPoint` 与 timeline
+## 1. [已完成] `SyncPoint` 与 timeline
 
-当前 `SyncPoint` 保存：
+原先 `SyncPoint` 保存：
 
 ```rust
 pub struct SyncPoint {
@@ -73,9 +73,9 @@ impl SyncPoint {
 
 验证需要覆盖 known/foreign QueueId、旧 backend point、同一队列 last-use 合并，以及 submit 在调用 Vulkan API 前拒绝无效 wait point。
 
-## 2. 隐藏 Vulkan 实现层
+## 2. [已完成] 隐藏 Vulkan 实现层
 
-当前 `rhi.rs` 使用：
+原先 `rhi.rs` 使用：
 
 ```rust
 pub mod vk;
@@ -83,13 +83,13 @@ pub mod vk;
 
 并且 `Instance`、`Device`、`VulkanDevice` 是公开类型，`Device` 还公开了 `ash::Device`、queue family 等字段。外部代码可以因此绕过 `Backend` wrapper。
 
-建议改为：
+现已改为：
 
 ```rust
 pub(crate) mod vk;
 ```
 
-或在不需要兄弟模块访问时直接使用 private module。同时收紧 `Instance`、`Device`、`VulkanDevice`、它们的构造函数和 `collect_garbage()`。
+Vulkan 子模块、`Instance`、`Device`、`VulkanDevice`、它们的构造函数和 `collect_garbage()` 也已收紧为 crate-private；native device 和 feature 字段不再对外公开。
 
 外部用户只接触：
 
@@ -102,11 +102,11 @@ pub(crate) mod vk;
 
 如果以后需要 Vulkan native interop，应设计显式 extension trait 或 feature，而不是公开整个 backend 实现目录。
 
-## 3. 补齐 wrapper 固有方法
+## 3. [已完成] 补齐 wrapper 固有方法
 
 部分 wrapper 已经持有 `Arc<dyn Rhi*>`，但用户需要的查询能力仍然只存在于 crate-private trait。
 
-建议增加：
+现已增加：
 
 ```rust
 impl Buffer {
@@ -127,7 +127,7 @@ impl ImageView {
 
 `Sampler`、`Pipeline`、`DescriptorSet` 当前没有需要公开查询的 backend-neutral 属性，所以暂时只保留构造和生命周期接口。
 
-## 4. 收紧 tracker 类型
+## 4. [已完成] 收紧 tracker 类型
 
 以下类型仅服务于自动 barrier 和 lifetime 系统，不属于用户 API：
 
@@ -136,7 +136,7 @@ impl ImageView {
 - `ResourceTracker`
 - `lifetime` 模块中的 manager、reservation 和内部状态
 
-建议使用：
+现已使用 crate-private 可见性：
 
 ```rust
 pub(crate) struct ObjectId(...);
@@ -161,12 +161,10 @@ pub(crate) struct ResourceTracker { ... }
 
 `RhiCommandBuffer` 是合理例外：它完全由 Queue/Recorder 内部租赁和回收，没有直接暴露给用户，因此不需要额外的公开 `CommandBuffer` wrapper。
 
+所有 wrapper 的 `inner()` 均只在 crate 内使用；`Sampler::inner()` 已与其他资源 wrapper 统一为 `pub(crate)`。
+
 Shader compiler 与 reflection 也不属于 backend-owned GPU object，应继续保持普通 value/service 类型。
 
-## 推荐实施顺序
+## 审查状态
 
-1. 将 `SyncPoint` 和 native timeline 重构为 wrapper + trait object 生命周期模型。
-2. 隐藏 `rhi::vk` 与所有 Vulkan implementation type。
-3. 补齐资源 wrapper 的公开固有查询方法。
-4. 收紧 tracker、identity 与 lifetime 类型的可见性。
-5. 运行 `cargo +nightly fmt`、`cargo check`、完整测试和公开 API 泄漏检查。
+本文列出的 wrapper、SyncPoint、Vulkan implementation exposure 和内部 tracker 可见性问题均已完成。

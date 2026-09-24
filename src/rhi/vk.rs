@@ -1,8 +1,8 @@
 mod allocator;
-pub mod command;
-pub mod descriptor;
-pub mod device;
-pub mod instance;
-pub mod pipeline;
-pub mod queue;
-pub mod resource;
+pub(crate) mod command;
+pub(crate) mod descriptor;
+pub(crate) mod device;
+pub(crate) mod instance;
+pub(crate) mod pipeline;
+pub(crate) mod queue;
+pub(crate) mod resource;

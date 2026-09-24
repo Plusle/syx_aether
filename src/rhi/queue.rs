@@ -25,10 +25,6 @@ pub enum QueueKind {
     Transfer,
 }
 
-/// Public handle for a logical backend queue.
-///
-/// Queue operations are implemented through the backend-neutral queue
-/// interface; the concrete backend queue remains private to the crate.
 #[derive(Clone)]
 pub struct Queue {
     inner: Arc<dyn RhiQueue>,
@@ -70,7 +66,6 @@ impl Queue {
     }
 }
 
-/// Process-local identity for one logical queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct QueueId(u64);
 
@@ -81,10 +76,6 @@ impl QueueId {
     }
 }
 
-/// A backend-neutral GPU queue.
-///
-/// A recorder holds this queue's exclusive lease from allocation through
-/// build and submit (or drop), so one queue can have at most one live recorder.
 pub(crate) trait RhiQueue: RhiType {
     fn kind(&self) -> QueueKind;
     fn id(&self) -> QueueId;
@@ -176,7 +167,6 @@ pub(crate) fn force_flush(queue: &dyn RhiQueue) -> RhiResult<()> {
     queue.force_flush_backend()
 }
 
-/// Ordered command collection backed by one queue-owned command buffer.
 pub struct Recorder<'queue, 'command> {
     queue: &'queue dyn RhiQueue,
     // Kept for its lifetime; submit deliberately does not lock the queue again.
@@ -199,7 +189,7 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
         self.commands.push(command);
     }
 
-    pub(crate) fn extend(&mut self, commands: impl IntoIterator<Item = Command<'command>>) {
+    pub(crate) fn extend(&mut self, commands: impl IntoIterator<Item=Command<'command>>) {
         self.commands.extend(commands);
     }
 
@@ -427,7 +417,6 @@ impl<'queue, 'command> Recorder<'queue, 'command> {
         self.command(Command::InsertDebugLabel(name))
     }
 
-    /// Plan barriers and record all commands into the owned command buffer.
     pub fn build(mut self) -> RhiResult<BuiltRecorder<'queue>> {
         self.queue.validate_commands(&self.commands)?;
 
@@ -473,7 +462,6 @@ impl Drop for Recorder<'_, '_> {
     }
 }
 
-/// A successfully recorded command buffer that can be submitted exactly once.
 pub struct BuiltRecorder<'queue> {
     queue: &'queue dyn RhiQueue,
     lease: Option<MutexGuard<'queue, ()>>,
@@ -592,8 +580,7 @@ mod tests {
             _: &Image,
             _: &ImageCopyRegion,
             _: [u32; 3],
-        ) {
-        }
+        ) {}
         fn bind_pipeline(&mut self, _: &Pipeline) {}
         fn bind_vertex_buffers(&mut self, _: u32, _: &[(&Buffer, u64)]) {}
         fn bind_index_buffer(&mut self, _: &Buffer, _: u64, _: IndexType) {}
@@ -770,7 +757,7 @@ mod tests {
                 .unwrap()
                 .pending
                 .push(Pending { buffer, value });
-            Ok(SyncPoint::new(self.timeline, value))
+            Ok(SyncPoint::new(self.id, self.timeline, value))
         }
         fn force_flush_backend(&self) -> RhiResult<()> {
             let mut buffers = self.buffers.lock().unwrap();

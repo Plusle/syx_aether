@@ -5,10 +5,8 @@ use crate::rhi::{
 };
 use std::sync::Arc;
 
-/// Backend implementation of a bound descriptor set.
 pub(crate) trait RhiDescriptorSet: RhiObject {}
 
-/// Owning, backend-neutral descriptor-set handle.
 #[derive(Debug)]
 pub struct DescriptorSet {
     inner: Option<Arc<dyn RhiDescriptorSet>>,

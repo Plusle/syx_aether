@@ -5,12 +5,10 @@ use std::ffi::{c_void, CStr, CString};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
-pub struct Instance {
-    pub instance: ash::Instance,
-    pub debug_utils: Option<debug_utils::Instance>,
-    pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
-    /// Dropped last (declaration order): instance must be destroyed before
-    /// the entry's dynamic library is unloaded.
+pub(crate) struct Instance {
+    pub(crate) instance: ash::Instance,
+    debug_utils: Option<debug_utils::Instance>,
+    debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
     _entry: Entry,
 }
 
@@ -27,7 +25,7 @@ impl From<vk::Result> for RhiError {
 }
 
 impl Instance {
-    pub fn new(app_name: &str, enable_validation: bool) -> Result<Self, RhiError> {
+    pub(crate) fn new(app_name: &str, enable_validation: bool) -> Result<Self, RhiError> {
         let entry = unsafe { Entry::load()? };
 
         let app_name = CString::new(app_name).unwrap_or_else(|_| CString::new("aether").unwrap());

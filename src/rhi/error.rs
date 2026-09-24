@@ -7,6 +7,7 @@ pub enum RhiError {
     UnsupportedBackend,
     BackendError(String),
     InvalidCommand(String),
+    InvalidSyncPoint(String),
     ResourceState(String),
     Shader(String),
 
@@ -19,6 +20,7 @@ impl fmt::Display for RhiError {
             RhiError::UnsupportedBackend => write!(f, "Unsupported backend"),
             RhiError::BackendError(s) => write!(f, "Backend error: {}", s),
             RhiError::InvalidCommand(s) => write!(f, "Invalid command stream: {}", s),
+            RhiError::InvalidSyncPoint(s) => write!(f, "Invalid sync point: {}", s),
             RhiError::ResourceState(s) => write!(f, "Resource state error: {}", s),
             RhiError::Shader(msg) => write!(f, "Shader error: {}", msg),
 

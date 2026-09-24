@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::rhi::{
-    backend::RhiBackend,
+    backend::{backend, RhiBackend},
     command::Command,
     descriptor::RhiDescriptorSet,
     error::{RhiError, RhiResult},
@@ -18,13 +18,11 @@ use std::{
     },
 };
 
-/// Process-local identity shared by every RHI object with a GPU lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ObjectId(u64);
+pub(crate) struct ObjectId(u64);
 
 impl ObjectId {
-    /// Allocates a process-unique identity for one RHI object.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::allocate()
     }
 
@@ -33,7 +31,7 @@ impl ObjectId {
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
-    pub const fn get(self) -> u64 {
+    pub(crate) const fn get(self) -> u64 {
         self.0
     }
 }
@@ -44,12 +42,10 @@ impl Default for ObjectId {
     }
 }
 
-/// Common identity for objects that can be referenced by native GPU work.
 pub(crate) trait RhiObject: RhiType {
     fn id(&self) -> ObjectId;
 }
 
-/// A backend object whose public wrapper has been dropped.
 #[derive(Debug)]
 pub(crate) enum DiscardedObject {
     Buffer(Arc<dyn RhiBuffer>),
@@ -108,11 +104,10 @@ impl ReservationId {
 #[derive(Debug, Default)]
 struct LifetimeEntry {
     reservation: Option<ReservationId>,
-    last_uses: HashMap<u64, SyncPoint>,
+    last_uses: HashMap<crate::rhi::queue::QueueId, SyncPoint>,
     retired: bool,
 }
 
-/// Device-global scheduling and retirement state for every RHI object.
 #[derive(Debug, Default)]
 pub(crate) struct LifetimeTracker {
     objects: Mutex<HashMap<ObjectId, LifetimeEntry>>,
@@ -124,7 +119,6 @@ pub(crate) fn lifetime_tracker() -> Arc<LifetimeTracker> {
     Arc::clone(GLOBAL_LIFETIME.get_or_init(|| Arc::new(LifetimeTracker::new())))
 }
 
-/// Device-global queue of backend objects awaiting safe destruction.
 #[derive(Debug)]
 pub(crate) struct DiscardManager {
     lifetime: Arc<LifetimeTracker>,
@@ -153,7 +147,8 @@ impl DiscardManager {
             .push(object);
     }
 
-    pub(crate) fn flush(&self, backend: &dyn RhiBackend, completed: impl Fn(SyncPoint) -> bool) {
+    pub(crate) fn flush(&self, completed: impl Fn(SyncPoint) -> bool) -> RhiResult<()> {
+        let backend = backend()?;
         let pending = std::mem::take(
             &mut *self
                 .pending
@@ -176,12 +171,14 @@ impl DiscardManager {
 
         for object in ready {
             let id = object.id();
-            object.destroy(backend);
+            object.destroy(backend.inner());
             self.lifetime.forget(id);
         }
+        Ok(())
     }
 
-    pub(crate) fn destroy_all(&self, backend: &dyn RhiBackend) {
+    pub(crate) fn destroy_all(&self) -> RhiResult<()> {
+        let backend = backend()?;
         let mut pending = std::mem::take(
             &mut *self
                 .pending
@@ -195,9 +192,10 @@ impl DiscardManager {
                 .expect("discarded backend objects contain an ownership cycle");
             let object = pending.swap_remove(index);
             let id = object.id();
-            object.destroy(backend);
+            object.destroy(backend.inner());
             self.lifetime.forget(id);
         }
+        Ok(())
     }
 }
 
@@ -215,7 +213,7 @@ impl LifetimeTracker {
 
     pub(crate) fn reserve(
         self: &Arc<Self>,
-        objects: impl IntoIterator<Item = ObjectId>,
+        objects: impl IntoIterator<Item=ObjectId>,
     ) -> RhiResult<LifetimeReservation> {
         let objects: Vec<_> = objects
             .into_iter()
@@ -327,7 +325,7 @@ impl LifetimeReservation {
         for object in &self.objects {
             if let Some(entry) = entries.get_mut(object) {
                 if entry.reservation == Some(self.id) {
-                    entry.last_uses.insert(point.timeline(), point);
+                    entry.last_uses.insert(point.queue(), point);
                     entry.reservation = None;
                 }
             }

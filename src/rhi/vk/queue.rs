@@ -62,6 +62,17 @@ impl VkQueueRegistry {
             .ok_or_else(|| RhiError::BackendError(format!("{kind:?} queue is unavailable")))
     }
 
+    pub(crate) fn validate_sync_point(&self, point: SyncPoint) -> RhiResult<()> {
+        if self.family_by_id.contains_key(&point.queue()) {
+            Ok(())
+        } else {
+            Err(RhiError::InvalidSyncPoint(format!(
+                "queue {:?} does not belong to this backend",
+                point.queue()
+            )))
+        }
+    }
+
     pub(super) fn family(&self, id: QueueId) -> u32 {
         *self
             .family_by_id
@@ -194,12 +205,13 @@ impl VkCommandQueue {
         let wait_infos: Vec<_> = waits
             .iter()
             .map(|point| {
-                vk::SemaphoreSubmitInfo::default()
+                self.queues.validate_sync_point(*point)?;
+                Ok(vk::SemaphoreSubmitInfo::default()
                     .semaphore(vk::Semaphore::from_raw(point.timeline()))
                     .value(point.value())
-                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS))
             })
-            .collect();
+            .collect::<RhiResult<_>>()?;
         let command_infos =
             [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer.handle())];
         let signal_infos = [vk::SemaphoreSubmitInfo::default()
@@ -219,7 +231,10 @@ impl VkCommandQueue {
                 .device
                 .queue_submit2(self.handle, &submit_infos, vk::Fence::null())
         }?;
-        Ok((SyncPoint::new(self.timeline.as_raw(), value), value))
+        Ok((
+            SyncPoint::new(self.info.id, self.timeline.as_raw(), value),
+            value,
+        ))
     }
 }
 
@@ -568,6 +583,25 @@ mod tests {
         assert!(matches!(
             validate_vk_commands(&commands),
             Err(RhiError::InvalidCommand(_))
+        ));
+    }
+
+    #[test]
+    fn queue_registry_rejects_foreign_sync_points() {
+        let known = VkQueueInfo {
+            id: QueueId::allocate(),
+            kind: QueueKind::Graphics,
+            family: 0,
+            index: 0,
+        };
+        let registry = VkQueueRegistry::new([known]);
+        let valid = SyncPoint::new(known.id, 11, 1);
+        let foreign = SyncPoint::new(QueueId::allocate(), 13, 1);
+
+        assert!(registry.validate_sync_point(valid).is_ok());
+        assert!(matches!(
+            registry.validate_sync_point(foreign),
+            Err(RhiError::InvalidSyncPoint(_))
         ));
     }
 }

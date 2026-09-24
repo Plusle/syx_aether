@@ -22,28 +22,27 @@ use crate::{
 };
 use ash::{vk, vk::Handle};
 use std::{
-    collections::HashSet,
     ffi::CStr,
     fmt::{Debug, Formatter},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-pub struct Device {
+pub(crate) struct Device {
     // Held only to keep the instance alive for the device's lifetime.
     _instance: Arc<Instance>,
-    pub device: ash::Device,
-    pub graphics_queue_family: u32,
-    pub transfer_queue_family: u32,
-    pub transfer_queue_index: u32,
-    pub buffer_device_address: bool,
+    pub(crate) device: ash::Device,
+    graphics_queue_family: u32,
+    transfer_queue_family: u32,
+    transfer_queue_index: u32,
+    pub(crate) buffer_device_address: bool,
     allocator: Option<Allocator>,
     pub(crate) tracker: Arc<ResourceTracker>,
     pub(crate) lifetime: Arc<LifetimeTracker>,
 }
 
 impl Device {
-    pub fn new(instance: Arc<Instance>) -> Result<Self, RhiError> {
+    pub(crate) fn new(instance: Arc<Instance>) -> Result<Self, RhiError> {
         let inst = &instance.instance;
         let physical_devices = unsafe { inst.enumerate_physical_devices()? };
 
@@ -208,15 +207,15 @@ impl Drop for Device {
     }
 }
 
-pub struct VulkanDevice {
+pub(crate) struct VulkanDevice {
     graphics_queue: Arc<VkCommandQueue>,
     transfer_queue: Arc<VkCommandQueue>,
+    queues: Arc<VkQueueRegistry>,
     ctx: Arc<Device>,
-    timelines: HashSet<vk::Semaphore>,
 }
 
 impl VulkanDevice {
-    pub fn new(ctx: Device) -> RhiResult<Self> {
+    pub(crate) fn new(ctx: Device) -> RhiResult<Self> {
         let ctx = Arc::new(ctx);
         let graphics_info = VkQueueInfo {
             id: QueueId::allocate(),
@@ -256,24 +255,26 @@ impl VulkanDevice {
             Arc::clone(&ctx),
             transfer_info,
             Arc::clone(&ctx.tracker),
-            registry,
+            Arc::clone(&registry),
             transfer_submit_gate,
         )?);
-        let timelines = HashSet::from([graphics_queue.timeline(), transfer_queue.timeline()]);
         Ok(Self {
             graphics_queue,
             transfer_queue,
+            queues: registry,
             ctx,
-            timelines,
         })
     }
 
-    pub fn collect_garbage(&self) {
-        DiscardManager::global().flush(self, |point| {
+    pub(crate) fn collect_garbage(&self) -> RhiResult<()> {
+        DiscardManager::global().flush(|point| {
+            if self.queues.validate_sync_point(point).is_err() {
+                return false;
+            }
             let semaphore = vk::Semaphore::from_raw(point.timeline());
             unsafe { self.ctx.device.get_semaphore_counter_value(semaphore) }
                 .is_ok_and(|completed| completed >= point.value())
-        });
+        })
     }
 }
 
@@ -371,13 +372,8 @@ impl RhiBackend for VulkanDevice {
     }
 
     fn wait(&self, point: SyncPoint, timeout: Option<Duration>) -> RhiResult<()> {
+        self.queues.validate_sync_point(point)?;
         let semaphore = vk::Semaphore::from_raw(point.timeline());
-        #[cfg(debug_assertions)]
-        if !self.timelines.contains(&semaphore) {
-            return Err(RhiError::BackendError(
-                "wait references an unknown timeline".to_string(),
-            ));
-        }
 
         let timeout_ns = timeout
             .map(|t| t.as_nanos().min(u64::MAX as u128) as u64)
@@ -395,5 +391,10 @@ impl RhiBackend for VulkanDevice {
             )),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn wait_all(&self) -> RhiResult<()> {
+        unsafe { self.ctx.device.device_wait_idle() }?;
+        Ok(())
     }
 }

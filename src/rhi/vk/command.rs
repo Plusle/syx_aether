@@ -26,10 +26,6 @@ use std::{
     sync::Arc,
 };
 
-/// A non-owning Vulkan command-buffer recorder.
-///
-/// The command pool owns `handle`; the cloned Ash device is only a dispatch
-/// table for recording commands.
 pub(crate) struct VkCommandBuffer {
     handle: vk::CommandBuffer,
     device: ash::Device,
