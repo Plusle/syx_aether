@@ -1,167 +1,310 @@
 #![allow(dead_code)]
 
-use crate::rhi::{
-    descriptor::{DescriptorSet, RhiDescriptorSet},
-    error::{RhiError, RhiResult},
-    lifetime::DiscardManager,
-    pipeline::{Pipeline, RhiPipeline},
-    queue::{Queue, QueueKind, RhiQueue},
-    resource::{Buffer, Image, ImageView, RhiBuffer, RhiImage, RhiImageView, RhiSampler, Sampler},
-    sync::SyncPoint,
-    types::{BufferDesc, ImageDesc, ImageViewDesc, RhiType, SamplerDesc},
-    vk::{
-        device::{Device, VulkanDevice},
-        instance::Instance,
-    },
+//! Private object-safe backend contracts. Creation never performs hidden submission.
+//! Backend resources retain native device state independently of the public Device.
+
+use super::command::{
+    BufferCopy, BufferImageCopy, DynamicState, ImageBlit, ImageCopy, IndexBufferBinding,
+    RenderingDesc, VertexBufferBinding,
 };
-use std::{
-    sync::{Arc, OnceLock, RwLock},
-    time::Duration,
+use super::descriptor::{
+    DescriptorPoolDesc, DescriptorSetLayout, DescriptorSetLayoutDesc, DescriptorWrite,
+    PipelineLayout, PipelineLayoutDesc, PipelineLayoutId,
 };
+use super::device::{Capabilities, DeviceSelection};
+use super::error::{RhiResult, ValidationMessage};
+use super::lifetime::ObjectId;
+use super::pipeline::{PipelineDesc, PipelineKind};
+use super::query::{QueryPool, QueryPoolDesc, QueryResult, TimestampStage};
+use super::resource::{Buffer, BufferDesc, Image, ImageDesc, ImageViewDesc, SamplerDesc};
+use super::shader::{ShaderInterface, ShaderModuleDesc};
+use super::swapchain::{
+    AcquireToken, PresentOutcome, PresentToken, SurfaceCapabilities, SwapchainDesc, SwapchainId,
+};
+use super::sync::{DeviceId, QueueCapabilities, QueueId};
+use super::tracking::PlannedBarrier;
+use super::types::{BackendType, BufferRange, QueueKind, ShaderStageFlags};
+use std::any::Any;
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
 
-type BackendSlot = RwLock<Option<Arc<Backend>>>;
-
-static BACKEND: OnceLock<BackendSlot> = OnceLock::new();
-
-fn backend_slot() -> &'static BackendSlot {
-    BACKEND.get_or_init(|| RwLock::new(None))
+/// Any permits checked backend-local downcasts; no reinterpretation is part of the API.
+pub(crate) trait RhiObject: Any + Send + Sync {
+    fn object_id(&self) -> ObjectId;
 }
 
-pub enum BackendType {
-    Vulkan,
-    Metal,
-    D3D12,
-}
-
-#[derive(Debug, Clone)]
-pub struct Backend {
-    inner: Arc<dyn RhiBackend>,
-}
-
-impl Backend {
-    pub fn global() -> RhiResult<Arc<Self>> {
-        backend()
-    }
-
-    pub(crate) fn create_buffer(&self, desc: BufferDesc) -> RhiResult<Buffer> {
-        Ok(Buffer::from_inner(self.inner.create_buffer(desc)?))
-    }
-
-    pub(crate) fn create_image(&self, desc: ImageDesc) -> RhiResult<Image> {
-        Ok(Image::from_inner(self.inner.create_image(desc)?))
-    }
-
-    pub(crate) fn create_sampler(&self, desc: SamplerDesc) -> RhiResult<Sampler> {
-        Ok(Sampler::from_inner(self.inner.create_sampler(desc)?))
-    }
-
-    pub(crate) fn create_image_view(
-        &self,
-        image: &Image,
-        desc: ImageViewDesc,
-    ) -> RhiResult<ImageView> {
-        let image = image.inner_arc();
-        let inner = self.inner.create_image_view(&image, desc)?;
-        Ok(ImageView::from_inner(inner))
-    }
-
-    pub(crate) fn create_pipeline(&self) -> RhiResult<Pipeline> {
-        Ok(Pipeline::from_inner(self.inner.create_pipeline()?))
-    }
-
-    pub(crate) fn create_descriptor_set(&self) -> RhiResult<DescriptorSet> {
-        Ok(DescriptorSet::from_inner(
-            self.inner.create_descriptor_set()?,
-        ))
-    }
-
-    pub fn queue(&self, kind: QueueKind) -> RhiResult<Queue> {
-        Ok(Queue::new(self.inner.queue(kind)?))
-    }
-
-    pub fn wait(&self, point: SyncPoint, timeout: Option<Duration>) -> RhiResult<()> {
-        self.inner.wait(point, timeout)
-    }
-
-    pub fn wait_all(&self) -> RhiResult<()> {
-        self.inner.wait_all()
-    }
-
-    pub(crate) fn inner(&self) -> &dyn RhiBackend {
-        self.inner.as_ref()
-    }
-}
-
-pub fn bootstrap(t: BackendType) -> RhiResult<()> {
-    let mut current = backend_slot()
-        .write()
-        .map_err(|_| RhiError::BackendError("global backend lock poisoned".into()))?;
-    if current.is_some() {
-        return Err(RhiError::BackendError(
-            "an RHI backend is already initialized".into(),
-        ));
-    }
-
-    let inner: Arc<dyn RhiBackend> = match t {
-        BackendType::Vulkan => {
-            let instance = Arc::new(Instance::new("aether", cfg!(debug_assertions))?);
-            let device = Device::new(instance)?;
-            Arc::new(VulkanDevice::new(device)?)
-        }
-        BackendType::Metal | BackendType::D3D12 => return Err(RhiError::UnsupportedBackend),
-    };
-    *current = Some(Arc::new(Backend { inner }));
-    Ok(())
-}
-
-pub(crate) fn backend() -> RhiResult<Arc<Backend>> {
-    backend_slot()
-        .read()
-        .map_err(|_| RhiError::BackendError("global backend lock poisoned".into()))?
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| RhiError::BackendError("the RHI backend is not initialized".into()))
-}
-
-pub fn terminate() -> RhiResult<()> {
-    let backend = backend_slot()
-        .read()
-        .map_err(|_| RhiError::BackendError("global backend lock poisoned".into()))?
-        .as_ref()
-        .cloned();
-    if let Some(backend) = backend.as_deref() {
-        backend.wait_all()?;
-        DiscardManager::global().destroy_all()?;
-    }
-    let b = backend_slot()
-        .write()
-        .map_err(|_| RhiError::BackendError("global backend lock poisoned".into()))?
-        .take();
-    drop(b);
-    Ok(())
-}
-
-pub(crate) trait RhiBackend: RhiType {
-    fn queue(&self, kind: QueueKind) -> RhiResult<Arc<dyn RhiQueue>>;
-
-    fn create_buffer(&self, desc: BufferDesc) -> RhiResult<Arc<dyn RhiBuffer>>;
-    fn create_image(&self, desc: ImageDesc) -> RhiResult<Arc<dyn RhiImage>>;
-    fn create_sampler(&self, desc: SamplerDesc) -> RhiResult<Arc<dyn RhiSampler>>;
+pub(crate) trait RhiDevice: Any + Send + Sync {
+    fn device_id(&self) -> DeviceId;
+    fn selection(&self) -> &DeviceSelection;
+    fn capabilities(&self) -> &Capabilities;
+    fn create_queue(&self, id: QueueId, kind: QueueKind) -> RhiResult<Arc<dyn RhiQueue>>;
+    fn create_buffer(&self, id: ObjectId, desc: &BufferDesc) -> RhiResult<Arc<dyn RhiBuffer>>;
+    fn create_image(&self, id: ObjectId, desc: &ImageDesc) -> RhiResult<Arc<dyn RhiImage>>;
     fn create_image_view(
         &self,
+        id: ObjectId,
         image: &Arc<dyn RhiImage>,
-        desc: ImageViewDesc,
+        desc: &ImageViewDesc,
     ) -> RhiResult<Arc<dyn RhiImageView>>;
-    fn create_pipeline(&self) -> RhiResult<Arc<dyn RhiPipeline>>;
-    fn create_descriptor_set(&self) -> RhiResult<Arc<dyn RhiDescriptorSet>>;
+    fn create_sampler(&self, id: ObjectId, desc: &SamplerDesc) -> RhiResult<Arc<dyn RhiSampler>>;
+    fn create_shader_module(
+        &self,
+        id: ObjectId,
+        desc: &ShaderModuleDesc,
+    ) -> RhiResult<Arc<dyn RhiShaderModule>>;
+    fn create_descriptor_set_layout(
+        &self,
+        id: ObjectId,
+        desc: &DescriptorSetLayoutDesc,
+    ) -> RhiResult<Arc<dyn RhiDescriptorSetLayout>>;
+    fn create_pipeline_layout(
+        &self,
+        id: ObjectId,
+        desc: &PipelineLayoutDesc<'_>,
+    ) -> RhiResult<Arc<dyn RhiPipelineLayout>>;
+    fn create_pipeline(
+        &self,
+        id: ObjectId,
+        desc: &PipelineDesc<'_>,
+    ) -> RhiResult<Arc<dyn RhiPipeline>>;
+    fn create_descriptor_pool(
+        &self,
+        desc: &DescriptorPoolDesc,
+    ) -> RhiResult<Arc<dyn RhiDescriptorPool>>;
+    fn surface_capabilities(&self, surface: &dyn RhiSurface) -> RhiResult<SurfaceCapabilities>;
+    fn create_swapchain(
+        &self,
+        id: SwapchainId,
+        surface: &Arc<dyn RhiSurface>,
+        desc: &SwapchainDesc,
+    ) -> RhiResult<Box<dyn RhiSwapchain>>;
+    fn create_query_pool(
+        &self,
+        id: ObjectId,
+        desc: &QueryPoolDesc,
+    ) -> RhiResult<Arc<dyn RhiQueryPool>>;
+    fn wait(&self, queue: &dyn RhiQueue, value: u64, timeout: Option<Duration>) -> RhiResult<()>;
+    /// Full-device waits are reserved for shutdown by the common layer.
+    fn wait_idle(&self) -> RhiResult<()>;
+    fn set_object_name(&self, object: &dyn RhiObject, name: &str) -> RhiResult<()>;
+    fn drain_validation_messages(&self) -> Vec<ValidationMessage>;
+    fn load_pipeline_cache(&self, bytes: &[u8]) -> RhiResult<()>;
+    fn pipeline_cache_data(&self) -> RhiResult<Vec<u8>>;
+}
 
-    fn destroy_buffer(&self, buffer: Arc<dyn RhiBuffer>);
-    fn destroy_image(&self, image: Arc<dyn RhiImage>);
-    fn destroy_sampler(&self, sampler: Arc<dyn RhiSampler>);
-    fn destroy_image_view(&self, image_view: Arc<dyn RhiImageView>);
-    fn destroy_pipeline(&self, pipeline: Arc<dyn RhiPipeline>);
-    fn destroy_descriptor_set(&self, descriptor_set: Arc<dyn RhiDescriptorSet>);
+pub(crate) struct QueueWait<'a> {
+    pub(crate) queue: &'a dyn RhiQueue,
+    pub(crate) value: u64,
+}
 
-    fn wait(&self, point: SyncPoint, timeout: Option<Duration>) -> RhiResult<()>;
-    fn wait_all(&self) -> RhiResult<()>;
+pub(crate) struct PresentSubmission<'a> {
+    pub(crate) acquire: &'a AcquireToken,
+    pub(crate) signal: PresentToken,
+}
+
+/// The common queue allocates signal values under its shared submit gate.
+/// Success schedules work only; transactions are committed by the common layer.
+pub(crate) trait RhiQueue: Any + Send + Sync {
+    fn queue_id(&self) -> QueueId;
+    fn capabilities(&self) -> QueueCapabilities;
+    fn allocate_command_buffer(&self) -> RhiResult<Box<dyn RhiCommandBuffer>>;
+    fn recycle_command_buffer(&self, buffer: Box<dyn RhiCommandBuffer>) -> RhiResult<()>;
+    fn submit(
+        &self,
+        buffer: &dyn RhiCommandBuffer,
+        waits: &[QueueWait<'_>],
+        signal_value: u64,
+        present: Option<PresentSubmission<'_>>,
+    ) -> RhiResult<()>;
+    fn completed_value(&self) -> RhiResult<u64>;
+    fn wait(&self, value: u64, timeout: Option<Duration>) -> RhiResult<()>;
+    fn wait_idle(&self) -> RhiResult<()>;
+}
+
+/// Mutably recorded by one worker, then moved to a submitter. Sync is not required.
+/// Recording methods never retain the borrowed public facade objects.
+pub(crate) trait RhiCommandBuffer: Any + Send {
+    fn origin(&self) -> QueueId;
+    fn begin(&mut self) -> RhiResult<()>;
+    fn finish(&mut self) -> RhiResult<()>;
+    fn barriers(&mut self, barriers: &[PlannedBarrier<'_>]) -> RhiResult<()>;
+    fn begin_rendering(&mut self, desc: &RenderingDesc<'_>) -> RhiResult<()>;
+    fn end_rendering(&mut self) -> RhiResult<()>;
+    fn begin_compute(&mut self) -> RhiResult<()>;
+    fn end_compute(&mut self) -> RhiResult<()>;
+    fn bind_pipeline(&mut self, pipeline: &dyn RhiPipeline) -> RhiResult<()>;
+    fn bind_descriptor_sets(
+        &mut self,
+        kind: PipelineKind,
+        layout: &PipelineLayout,
+        first_set: u32,
+        sets: &[&dyn RhiDescriptorSet],
+        dynamic_offsets: &[u32],
+    ) -> RhiResult<()>;
+    fn bind_vertex_buffers(
+        &mut self,
+        first_binding: u32,
+        buffers: &[VertexBufferBinding<'_>],
+    ) -> RhiResult<()>;
+    fn bind_index_buffer(&mut self, binding: &IndexBufferBinding<'_>) -> RhiResult<()>;
+    fn push_constants(
+        &mut self,
+        layout: &PipelineLayout,
+        stages: ShaderStageFlags,
+        offset: u32,
+        bytes: &[u8],
+    ) -> RhiResult<()>;
+    fn set_dynamic_state(&mut self, state: &DynamicState) -> RhiResult<()>;
+    fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) -> RhiResult<()>;
+    fn draw_indexed(
+        &mut self,
+        indices: Range<u32>,
+        vertex_offset: i32,
+        instances: Range<u32>,
+    ) -> RhiResult<()>;
+    fn draw_indirect(
+        &mut self,
+        buffer: &Buffer,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    ) -> RhiResult<()>;
+    fn draw_indexed_indirect(
+        &mut self,
+        buffer: &Buffer,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    ) -> RhiResult<()>;
+    fn dispatch(&mut self, groups: [u32; 3]) -> RhiResult<()>;
+    fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64) -> RhiResult<()>;
+    fn copy_buffer(&mut self, src: &Buffer, dst: &Buffer, regions: &[BufferCopy]) -> RhiResult<()>;
+    fn copy_buffer_to_image(
+        &mut self,
+        src: &Buffer,
+        dst: &Image,
+        regions: &[BufferImageCopy],
+    ) -> RhiResult<()>;
+    fn copy_image_to_buffer(
+        &mut self,
+        src: &Image,
+        dst: &Buffer,
+        regions: &[BufferImageCopy],
+    ) -> RhiResult<()>;
+    fn copy_image(&mut self, src: &Image, dst: &Image, regions: &[ImageCopy]) -> RhiResult<()>;
+    fn blit_image(&mut self, src: &Image, dst: &Image, regions: &[ImageBlit]) -> RhiResult<()>;
+    fn update_buffer(&mut self, dst: &Buffer, offset: u64, bytes: &[u8]) -> RhiResult<()>;
+    fn fill_buffer(&mut self, dst: &Buffer, range: BufferRange, value: u32) -> RhiResult<()>;
+    fn reset_queries(&mut self, pool: &QueryPool, queries: Range<u32>) -> RhiResult<()>;
+    fn write_timestamp(
+        &mut self,
+        pool: &QueryPool,
+        query: u32,
+        stage: TimestampStage,
+    ) -> RhiResult<()>;
+    fn begin_debug_label(&mut self, name: &str, color: [f32; 4]) -> RhiResult<()>;
+    fn end_debug_label(&mut self) -> RhiResult<()>;
+    fn insert_debug_label(&mut self, name: &str, color: [f32; 4]) -> RhiResult<()>;
+}
+
+/// Host operations must enforce bounds and memory class, flush/invalidate if needed,
+/// and never wait for or submit GPU work. Common reservations protect in-flight ranges.
+pub(crate) trait RhiBuffer: RhiObject {
+    fn desc(&self) -> &BufferDesc;
+    fn write(&self, offset: u64, bytes: &[u8]) -> RhiResult<()>;
+    fn read(&self, offset: u64, len: usize) -> RhiResult<Vec<u8>>;
+}
+
+/// Ordinary image allocations and externally owned swapchain images share this contract.
+/// A swapchain image's backend object must retain its native generation owner.
+pub(crate) trait RhiImage: RhiObject {
+    fn desc(&self) -> &ImageDesc;
+    fn ownership(&self) -> ImageOwnership;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImageOwnership {
+    Allocated,
+    Swapchain { id: SwapchainId, generation: u64 },
+}
+
+pub(crate) trait RhiImageView: RhiObject {
+    fn desc(&self) -> &ImageViewDesc;
+    fn image(&self) -> &Arc<dyn RhiImage>;
+}
+
+pub(crate) trait RhiSampler: RhiObject {
+    fn desc(&self) -> &SamplerDesc;
+}
+
+pub(crate) trait RhiShaderModule: RhiObject {
+    fn interface(&self) -> &ShaderInterface;
+}
+
+pub(crate) trait RhiDescriptorSetLayout: RhiObject {
+    fn desc(&self) -> &DescriptorSetLayoutDesc;
+}
+
+pub(crate) trait RhiPipelineLayout: RhiObject {
+    fn set_layouts(&self) -> &[Arc<dyn RhiDescriptorSetLayout>];
+    fn push_constant_ranges(&self) -> &[super::shader::PushConstantRange];
+}
+
+pub(crate) trait RhiPipeline: RhiObject {
+    fn kind(&self) -> PipelineKind;
+    fn layout_id(&self) -> PipelineLayoutId;
+}
+
+/// The common layer records strong written-resource references and validates updates.
+pub(crate) trait RhiDescriptorSet: RhiObject {
+    fn layout(&self) -> &dyn RhiDescriptorSetLayout;
+    fn write(&self, writes: &[DescriptorWrite<'_>]) -> RhiResult<()>;
+}
+
+pub(crate) trait RhiDescriptorPool: Any + Send + Sync {
+    fn allocate(
+        &self,
+        id: ObjectId,
+        layout: &DescriptorSetLayout,
+    ) -> RhiResult<Arc<dyn RhiDescriptorSet>>;
+    /// Caller proves the pool's submissions completed and invalidates the old generation.
+    fn reset(&self) -> RhiResult<()>;
+}
+
+pub(crate) trait RhiSurface: Any + Send + Sync {
+    fn backend_type(&self) -> BackendType;
+}
+
+pub(crate) struct BackendSwapchainImage {
+    pub(crate) image: Arc<dyn RhiImage>,
+    pub(crate) view: Arc<dyn RhiImageView>,
+}
+
+pub(crate) struct BackendAcquiredImage {
+    pub(crate) index: u32,
+    pub(crate) acquire: AcquireToken,
+    pub(crate) present: PresentToken,
+    pub(crate) suboptimal: bool,
+}
+
+pub(crate) enum BackendAcquireOutcome {
+    Acquired(BackendAcquiredImage),
+    OutOfDate,
+    Timeout,
+    SurfaceUnavailable,
+}
+
+pub(crate) trait RhiSwapchain: Any + Send {
+    fn desc(&self) -> &SwapchainDesc;
+    fn images(&self) -> &[BackendSwapchainImage];
+    fn acquire(&mut self, timeout: Option<Duration>) -> RhiResult<BackendAcquireOutcome>;
+    fn present(&mut self, token: PresentToken) -> RhiResult<PresentOutcome>;
+    fn reconfigure(&mut self, width: u32, height: u32) -> RhiResult<()>;
+}
+
+pub(crate) trait RhiQueryPool: RhiObject {
+    fn desc(&self) -> &QueryPoolDesc;
+    /// Nonblocking read; availability is reported per query.
+    fn results(&self, queries: Range<u32>) -> RhiResult<Vec<QueryResult>>;
 }

@@ -1,124 +1,175 @@
 #![allow(dead_code)]
 
-use crate::rhi::{
-    descriptor::DescriptorSet,
-    error::RhiResult,
-    pipeline::Pipeline,
-    queue::QueueKind,
-    resource::{Buffer, Image, ImageView, PlannedOp, Transition},
-    shader::ShaderStageFlags,
-    types::RhiType,
-};
+use super::descriptor::{DescriptorSet, PipelineLayout};
+use super::pipeline::Pipeline;
+use super::query::{QueryPool, TimestampStage};
+use super::queue::Recorder;
+use super::resource::{Buffer, Image, ImageView};
+use super::sync::{Access, SyncPoint};
+use super::types::*;
+use std::ops::Range;
 
-pub use crate::rhi::resource::ImageAspect;
-
-#[derive(Debug, Clone, Copy)]
-pub struct ColorAttachment<'a> {
-    pub view: &'a ImageView,
-    pub resolve: Option<&'a ImageView>,
-    pub load_op: LoadOp,
-    pub store_op: StoreOp,
+pub struct BufferBinding<'a> {
+    pub buffer: &'a Buffer,
+    pub offset: u64,
+    pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct DepthStencilAttachment<'a> {
-    pub view: &'a ImageView,
-    pub resolve: Option<&'a ImageView>,
-    pub depth_load_op: LoadOp,
-    pub depth_store_op: StoreOp,
-    pub stencil_load_op: LoadOp,
-    pub stencil_store_op: StoreOp,
+pub struct VertexBufferBinding<'a> {
+    pub buffer: &'a Buffer,
+    pub offset: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+pub struct IndexBufferBinding<'a> {
+    pub buffer: &'a Buffer,
+    pub offset: u64,
+    pub ty: IndexType,
+}
+
+pub struct RenderingAttachment<'a> {
+    pub view: &'a ImageView,
+    pub load: LoadOp,
+    pub store: StoreOp,
+    pub clear: Option<ClearValue>,
+    pub resolve: Option<ResolveAttachment<'a>>,
+}
+
+pub struct ResolveAttachment<'a> {
+    pub view: &'a ImageView,
+    pub mode: ResolveMode,
+}
+
 pub struct RenderingDesc<'a> {
-    pub color_attachments: &'a [ColorAttachment<'a>],
-    pub depth_stencil: Option<&'a DepthStencilAttachment<'a>>,
-    pub extent: [u32; 2],
+    pub name: &'a str,
+    pub area: Scissor,
     pub layer_count: u32,
+    pub colors: Vec<RenderingAttachment<'a>>,
+    pub depth: Option<RenderingAttachment<'a>>,
+    pub stencil: Option<RenderingAttachment<'a>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LoadOp {
-    Load,
-    Clear(ClearValue),
-    DontCare,
+pub struct DrawParams<'a> {
+    pub pipeline: &'a Pipeline,
+    pub vertex_buffers: &'a [VertexBufferBinding<'a>],
+    pub index_buffer: Option<IndexBufferBinding<'a>>,
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub first_vertex: u32,
+    pub first_instance: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StoreOp {
-    Store,
-    DontCare,
+#[derive(Clone, Copy, Debug)]
+pub struct BufferCopy {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ClearValue {
-    Color([f32; 4]),
-    DepthStencil { depth: f32, stencil: u32 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct BufferImageCopy {
     pub buffer_offset: u64,
-    pub image_subresource: ImageSubresourceLayers,
-    pub image_offset: [i32; 3],
-    pub image_extent: [u32; 3],
+    pub buffer_row_length: u32,
+    pub buffer_image_height: u32,
+    pub image_range: ImageSubresourceRange,
+    pub image_offset: Offset3d,
+    pub extent: Extent3d,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ImageSubresourceLayers {
-    pub aspect: ImageAspect,
-    pub mip: u32,
-    pub base_layer: u32,
-    pub layer_count: u32,
+#[derive(Clone, Copy, Debug)]
+pub struct ImageCopy {
+    pub src_range: ImageSubresourceRange,
+    pub src_offset: Offset3d,
+    pub dst_range: ImageSubresourceRange,
+    pub dst_offset: Offset3d,
+    pub extent: Extent3d,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ImageCopyRegion {
-    pub subresource: ImageSubresourceLayers,
-    pub offset: [i32; 3],
+#[derive(Clone, Copy, Debug)]
+pub struct ImageBlit {
+    pub src_range: ImageSubresourceRange,
+    pub src_offsets: [Offset3d; 2],
+    pub dst_range: ImageSubresourceRange,
+    pub dst_offsets: [Offset3d; 2],
+    pub filter: Filter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Viewport {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-    pub min_depth: f32,
-    pub max_depth: f32,
+pub enum ResourceRegion<'a> {
+    Buffer(&'a Buffer, BufferRange),
+    Image(&'a Image, ImageSubresourceRange),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
+/// Access intent only; native image layouts remain private to a backend.
+pub struct Transition<'a> {
+    pub resource: ResourceRegion<'a>,
+    pub before: Option<Access>,
+    pub after: Access,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexType {
-    U16,
-    U32,
+#[derive(Clone, Copy, Debug)]
+pub struct StencilFaceState {
+    pub fail: StencilOp,
+    pub pass: StencilOp,
+    pub depth_fail: StencilOp,
+    pub compare: CompareOp,
+    pub compare_mask: u32,
+    pub write_mask: u32,
+    pub reference: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Command<'a> {
+#[derive(Clone, Copy, Debug)]
+pub enum DynamicState {
+    Viewport(Viewport),
+    Scissor(Scissor),
+    BlendConstants([f32; 4]),
+    StencilFront(StencilFaceState),
+    StencilBack(StencilFaceState),
+    DepthBias {
+        constant: f32,
+        clamp: f32,
+        slope: f32,
+    },
+    DepthTest(bool),
+    DepthWrite(bool),
+    DepthCompare(CompareOp),
+    CullMode(CullMode),
+    FrontFace(FrontFace),
+    Topology(PrimitiveTopology),
+    PrimitiveRestart(bool),
+}
+
+/// Borrowed CPU stream consumed eagerly by build, never retained in a built buffer.
+pub enum Command<'a> {
     BeginRendering(RenderingDesc<'a>),
     EndRendering,
+    BeginCompute,
+    EndCompute,
+    BindPipeline(&'a Pipeline),
+    BindDescriptorSets {
+        layout: &'a PipelineLayout,
+        first_set: u32,
+        sets: Vec<&'a DescriptorSet>,
+        dynamic_offsets: Vec<u32>,
+    },
+    BindVertexBuffers {
+        first_binding: u32,
+        buffers: Vec<VertexBufferBinding<'a>>,
+    },
+    BindIndexBuffer(IndexBufferBinding<'a>),
+    PushConstants {
+        layout: &'a PipelineLayout,
+        stages: ShaderStageFlags,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
+    SetDynamicState(DynamicState),
     Draw {
-        vertex_count: u32,
-        instance_count: u32,
-        first_vertex: u32,
-        first_instance: u32,
+        vertices: Range<u32>,
+        instances: Range<u32>,
     },
     DrawIndexed {
-        index_count: u32,
-        instance_count: u32,
-        first_index: u32,
+        indices: Range<u32>,
         vertex_offset: i32,
-        first_instance: u32,
+        instances: Range<u32>,
     },
     DrawIndirect {
         buffer: &'a Buffer,
@@ -139,263 +190,77 @@ pub(crate) enum Command<'a> {
     },
     CopyBuffer {
         src: &'a Buffer,
-        src_offset: u64,
         dst: &'a Buffer,
-        dst_offset: u64,
-        size: u64,
+        regions: Vec<BufferCopy>,
     },
     CopyBufferToImage {
         src: &'a Buffer,
         dst: &'a Image,
-        region: BufferImageCopy,
+        regions: Vec<BufferImageCopy>,
     },
     CopyImageToBuffer {
         src: &'a Image,
         dst: &'a Buffer,
-        region: BufferImageCopy,
+        regions: Vec<BufferImageCopy>,
     },
     CopyImage {
         src: &'a Image,
-        src_region: ImageCopyRegion,
         dst: &'a Image,
-        dst_region: ImageCopyRegion,
-        extent: [u32; 3],
+        regions: Vec<ImageCopy>,
+    },
+    BlitImage {
+        src: &'a Image,
+        dst: &'a Image,
+        regions: Vec<ImageBlit>,
+    },
+    UpdateBuffer {
+        dst: &'a Buffer,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    FillBuffer {
+        dst: &'a Buffer,
+        range: BufferRange,
+        value: u32,
+    },
+    UseResource {
+        resource: ResourceRegion<'a>,
+        access: Access,
     },
     ReleaseBuffers {
-        buffers: &'a [&'a Buffer],
-        target: QueueKind,
+        destination: &'a super::queue::Queue,
+        buffers: Vec<(&'a Buffer, BufferRange)>,
     },
     ReleaseImages {
-        images: &'a [&'a Image],
-        target: QueueKind,
+        destination: &'a super::queue::Queue,
+        images: Vec<(&'a Image, ImageSubresourceRange)>,
     },
-    BindPipeline(&'a Pipeline),
-    BindVertexBuffers {
-        first: u32,
-        buffers: &'a [(&'a Buffer, u64)],
+    WaitOn(SyncPoint),
+    ResetQueries {
+        pool: &'a QueryPool,
+        queries: Range<u32>,
     },
-    BindIndexBuffer {
-        buffer: &'a Buffer,
-        offset: u64,
-        index_type: IndexType,
+    WriteTimestamp {
+        pool: &'a QueryPool,
+        query: u32,
+        stage: TimestampStage,
     },
-    BindDescriptorSets {
-        pipeline: &'a Pipeline,
-        first_set: u32,
-        sets: &'a [&'a DescriptorSet],
+    BeginDebugLabel {
+        name: String,
+        color: [f32; 4],
     },
-    PushConstants {
-        pipeline: &'a Pipeline,
-        stages: ShaderStageFlags,
-        offset: u32,
-        data: &'a [u8],
-    },
-    SetViewport(Viewport),
-    SetScissor(Rect),
-    SetBlendConstants([f32; 4]),
-    SetStencilReference(u32),
-    BeginDebugLabel(&'a str),
     EndDebugLabel,
-    InsertDebugLabel(&'a str),
+    InsertDebugLabel {
+        name: String,
+        color: [f32; 4],
+    },
 }
 
-pub(crate) trait RhiCommandBuffer: RhiType {
-    fn reset(&mut self) -> RhiResult<()>;
-
-    fn begin(&mut self) -> RhiResult<()>;
-
-    fn finish(&mut self) -> RhiResult<()>;
-
-    fn barrier(&mut self, descs: &[Transition<'_>]);
-
-    fn begin_rendering(&mut self, desc: &RenderingDesc<'_>);
-
-    fn end_rendering(&mut self);
-
-    fn draw(
-        &mut self,
-        vertex_count: u32,
-        instance_count: u32,
-        first_vertex: u32,
-        first_instance: u32,
-    );
-
-    fn draw_indexed(
-        &mut self,
-        index_count: u32,
-        instance_count: u32,
-        first_index: u32,
-        vertex_offset: i32,
-        first_instance: u32,
-    );
-
-    fn draw_indirect(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32);
-
-    fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32);
-
-    fn dispatch(&mut self, group_count: [u32; 3]);
-
-    fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64);
-
-    fn copy_buffer(
-        &mut self,
-        src: &Buffer,
-        src_offset: u64,
-        dst: &Buffer,
-        dst_offset: u64,
-        size: u64,
-    );
-
-    fn copy_buffer_to_image(&mut self, src: &Buffer, dst: &Image, region: &BufferImageCopy);
-
-    fn copy_image_to_buffer(&mut self, src: &Image, dst: &Buffer, region: &BufferImageCopy);
-
-    fn copy_image(
-        &mut self,
-        src: &Image,
-        src_region: &ImageCopyRegion,
-        dst: &Image,
-        dst_region: &ImageCopyRegion,
-        extent: [u32; 3],
-    );
-
-    fn bind_pipeline(&mut self, pipeline: &Pipeline);
-
-    fn bind_vertex_buffers(&mut self, first: u32, buffers: &[(&Buffer, u64)]);
-
-    fn bind_index_buffer(&mut self, buffer: &Buffer, offset: u64, index_type: IndexType);
-
-    fn bind_descriptor_sets(
-        &mut self,
-        pipeline: &Pipeline,
-        first_set: u32,
-        sets: &[&DescriptorSet],
-    );
-
-    fn push_constants(
-        &mut self,
-        pipeline: &Pipeline,
-        stages: ShaderStageFlags,
-        offset: u32,
-        data: &[u8],
-    );
-
-    fn set_viewport(&mut self, viewport: &Viewport);
-
-    fn set_scissor(&mut self, scissor: &Rect);
-
-    fn set_blend_constants(&mut self, constants: [f32; 4]);
-
-    fn set_stencil_reference(&mut self, reference: u32);
-
-    fn begin_debug_label(&mut self, name: &str);
-
-    fn end_debug_label(&mut self);
-
-    fn insert_debug_label(&mut self, name: &str);
+/// Encoder operation methods will be added with the public facade implementation.
+pub struct RenderPassEncoder<'pass, 'resource> {
+    pub(crate) recorder: &'pass mut Recorder<'resource>,
 }
 
-pub(crate) fn record_planned(
-    buffer: &mut dyn RhiCommandBuffer,
-    stream: &[PlannedOp<'_>],
-) -> RhiResult<()> {
-    buffer.begin()?;
-    for operation in stream {
-        match operation {
-            PlannedOp::Barriers(transitions) => buffer.barrier(transitions),
-            PlannedOp::Command(command) => record_command(buffer, *command),
-        }
-    }
-    buffer.finish()
-}
-
-fn record_command(buffer: &mut dyn RhiCommandBuffer, command: Command<'_>) {
-    match command {
-        Command::BeginRendering(desc) => buffer.begin_rendering(&desc),
-        Command::EndRendering => buffer.end_rendering(),
-        Command::Draw {
-            vertex_count,
-            instance_count,
-            first_vertex,
-            first_instance,
-        } => buffer.draw(vertex_count, instance_count, first_vertex, first_instance),
-        Command::DrawIndexed {
-            index_count,
-            instance_count,
-            first_index,
-            vertex_offset,
-            first_instance,
-        } => buffer.draw_indexed(
-            index_count,
-            instance_count,
-            first_index,
-            vertex_offset,
-            first_instance,
-        ),
-        Command::DrawIndirect {
-            buffer: source,
-            offset,
-            draw_count,
-            stride,
-        } => buffer.draw_indirect(source, offset, draw_count, stride),
-        Command::DrawIndexedIndirect {
-            buffer: source,
-            offset,
-            draw_count,
-            stride,
-        } => buffer.draw_indexed_indirect(source, offset, draw_count, stride),
-        Command::Dispatch(count) => buffer.dispatch(count),
-        Command::DispatchIndirect {
-            buffer: source,
-            offset,
-        } => buffer.dispatch_indirect(source, offset),
-        Command::CopyBuffer {
-            src,
-            src_offset,
-            dst,
-            dst_offset,
-            size,
-        } => buffer.copy_buffer(src, src_offset, dst, dst_offset, size),
-        Command::CopyBufferToImage { src, dst, region } => {
-            buffer.copy_buffer_to_image(src, dst, &region)
-        }
-        Command::CopyImageToBuffer { src, dst, region } => {
-            buffer.copy_image_to_buffer(src, dst, &region)
-        }
-        Command::CopyImage {
-            src,
-            src_region,
-            dst,
-            dst_region,
-            extent,
-        } => buffer.copy_image(src, &src_region, dst, &dst_region, extent),
-        Command::ReleaseBuffers { .. } | Command::ReleaseImages { .. } => {
-            unreachable!("release commands are consumed by the resource planner")
-        }
-        Command::BindPipeline(pipeline) => buffer.bind_pipeline(pipeline),
-        Command::BindVertexBuffers { first, buffers } => buffer.bind_vertex_buffers(first, buffers),
-        Command::BindIndexBuffer {
-            buffer: source,
-            offset,
-            index_type,
-        } => buffer.bind_index_buffer(source, offset, index_type),
-        Command::BindDescriptorSets {
-            pipeline,
-            first_set,
-            sets,
-        } => buffer.bind_descriptor_sets(pipeline, first_set, sets),
-        Command::PushConstants {
-            pipeline,
-            stages,
-            offset,
-            data,
-        } => buffer.push_constants(pipeline, stages, offset, data),
-        Command::SetViewport(viewport) => buffer.set_viewport(&viewport),
-        Command::SetScissor(scissor) => buffer.set_scissor(&scissor),
-        Command::SetBlendConstants(constants) => buffer.set_blend_constants(constants),
-        Command::SetStencilReference(reference) => buffer.set_stencil_reference(reference),
-        Command::BeginDebugLabel(name) => buffer.begin_debug_label(name),
-        Command::EndDebugLabel => buffer.end_debug_label(),
-        Command::InsertDebugLabel(name) => buffer.insert_debug_label(name),
-    }
+pub struct ComputePassEncoder<'pass, 'resource> {
+    pub(crate) recorder: &'pass mut Recorder<'resource>,
 }

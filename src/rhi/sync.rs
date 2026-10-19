@@ -1,49 +1,53 @@
 #![allow(dead_code)]
 
-use crate::rhi::queue::QueueId;
+use super::types::{QueueKind, ShaderStageFlags};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DeviceId(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct QueueId {
+    pub(crate) device: DeviceId,
+    pub(crate) index: u32,
+}
+
+/// Opaque completion value. Queue identities are device-qualified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SyncPoint {
-    queue: QueueId,
-    timeline: u64,
-    value: u64,
+    pub(crate) queue: QueueId,
+    pub(crate) value: u64,
 }
 
-impl SyncPoint {
-    pub(crate) const fn new(queue: QueueId, timeline: u64, value: u64) -> Self {
-        Self {
-            queue,
-            timeline,
-            value,
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FrameIndex(pub u32);
 
-    pub(crate) const fn queue(self) -> QueueId {
-        self.queue
-    }
-
-    pub(crate) const fn timeline(self) -> u64 {
-        self.timeline
-    }
-
-    pub const fn value(self) -> u64 {
-        self.value
-    }
+/// Host visibility is handled by buffer read/write operations, outside this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Access {
+    VertexRead,
+    IndexRead,
+    IndirectRead,
+    UniformRead(ShaderStageFlags),
+    StorageRead(ShaderStageFlags),
+    StorageWrite(ShaderStageFlags),
+    SampledRead(ShaderStageFlags),
+    StorageImageRead(ShaderStageFlags),
+    StorageImageWrite(ShaderStageFlags),
+    TransferRead,
+    TransferWrite,
+    ColorAttachmentReadWrite,
+    InputAttachmentRead,
+    DepthStencilReadWrite,
+    DepthStencilSampledRead(ShaderStageFlags),
+    Present,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sync_point_is_a_copyable_opaque_queue_value() {
-        let queue = QueueId::allocate();
-        let point = SyncPoint::new(queue, 17, 23);
-        let copied = point;
-
-        assert_eq!(copied.queue(), queue);
-        assert_eq!(copied.timeline(), 17);
-        assert_eq!(copied.value(), 23);
-        assert_eq!(point, copied);
-    }
+/// Queue kind and supported operations are reported independently of native families.
+#[derive(Clone, Copy, Debug)]
+pub struct QueueCapabilities {
+    pub kind: QueueKind,
+    pub graphics: bool,
+    pub compute: bool,
+    pub transfer: bool,
+    pub timestamp_valid_bits: u32,
 }

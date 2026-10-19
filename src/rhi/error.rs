@@ -1,32 +1,65 @@
 #![allow(dead_code)]
 
-use std::fmt;
-
-#[derive(Debug, Clone)]
-pub enum RhiError {
-    UnsupportedBackend,
-    BackendError(String),
-    InvalidCommand(String),
-    InvalidSyncPoint(String),
-    ResourceState(String),
-    Shader(String),
-
-    Unimplemented,
-}
-
-impl fmt::Display for RhiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RhiError::UnsupportedBackend => write!(f, "Unsupported backend"),
-            RhiError::BackendError(s) => write!(f, "Backend error: {}", s),
-            RhiError::InvalidCommand(s) => write!(f, "Invalid command stream: {}", s),
-            RhiError::InvalidSyncPoint(s) => write!(f, "Invalid sync point: {}", s),
-            RhiError::ResourceState(s) => write!(f, "Resource state error: {}", s),
-            RhiError::Shader(msg) => write!(f, "Shader error: {}", msg),
-
-            RhiError::Unimplemented => write!(f, "Unimplemented"),
-        }
-    }
-}
+use super::device::SkippedDevice;
+use std::error::Error;
 
 pub type RhiResult<T> = Result<T, RhiError>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderDiagnostic {
+    pub severity: DiagnosticSeverity,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidationMessage {
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub object_name: Option<String>,
+}
+
+/// Error data only; Display, Error, and conversion implementations are deferred.
+#[derive(Debug)]
+pub enum RhiError {
+    UnsupportedBackend,
+    DeviceSelection {
+        skipped: Vec<SkippedDevice>,
+    },
+    Backend {
+        context: &'static str,
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
+    InvalidCommand {
+        context: &'static str,
+        detail: String,
+    },
+    InvalidSyncPoint {
+        context: &'static str,
+    },
+    ResourceState {
+        context: &'static str,
+        detail: String,
+    },
+    ResourceBusy {
+        resource: String,
+    },
+    Shader {
+        diagnostics: Vec<ShaderDiagnostic>,
+    },
+    Validation(String),
+    DeviceLost,
+    OutOfMemory,
+    Unsupported {
+        feature: &'static str,
+    },
+}
